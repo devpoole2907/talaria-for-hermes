@@ -1,0 +1,191 @@
+import Foundation
+import Observation
+
+@MainActor
+@Observable
+final class AppPreferences {
+    private let defaults: UserDefaults
+
+    private enum Key {
+        static let activeProfileID = "activeProfileID"
+        static let hermesSessionKey = "hermesSessionKey"
+        static let defaultModelByProfile = "defaultModelByProfile"
+        static let recentModelsByProfile = "recentModelsByProfile"
+        static let pinnedSessionsByProfile = "pinnedSessionsByProfile"
+        static let draftTextBySession = "draftTextBySession"
+    }
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        self._activeProfileID = Self.readUUID(defaults, key: Key.activeProfileID)
+        self._hermesSessionKey = Self.resolveSessionKey(defaults)
+        self._defaultModelByProfile = Self.readModelMap(defaults, key: Key.defaultModelByProfile)
+        self._recentModelsByProfile = Self.readRecentModelMap(defaults, key: Key.recentModelsByProfile)
+        self._pinnedSessionsByProfile = Self.readStringArrayMap(defaults, key: Key.pinnedSessionsByProfile)
+        self._draftTextBySession = Self.readStringMap(defaults, key: Key.draftTextBySession)
+    }
+
+    // MARK: - Active profile
+
+    private var _activeProfileID: UUID?
+    var activeProfileID: UUID? {
+        get { access(keyPath: \._activeProfileID); return _activeProfileID }
+        set {
+            withMutation(keyPath: \._activeProfileID) { _activeProfileID = newValue }
+            defaults.set(newValue?.uuidString, forKey: Key.activeProfileID)
+        }
+    }
+
+    // MARK: - Hermes session key
+
+    private var _hermesSessionKey: String
+    var hermesSessionKey: String {
+        get { access(keyPath: \._hermesSessionKey); return _hermesSessionKey }
+    }
+
+    // MARK: - Default model per profile
+
+    private var _defaultModelByProfile: [String: String]
+    var defaultModelByProfile: [String: String] {
+        get { access(keyPath: \._defaultModelByProfile); return _defaultModelByProfile }
+        set {
+            withMutation(keyPath: \._defaultModelByProfile) { _defaultModelByProfile = newValue }
+            defaults.set(newValue, forKey: Key.defaultModelByProfile)
+        }
+    }
+
+    func defaultModelID(for profileID: UUID) -> String? {
+        defaultModelByProfile[profileID.uuidString]
+    }
+
+    func setDefaultModelID(_ modelID: String?, for profileID: UUID) {
+        var map = defaultModelByProfile
+        if let modelID {
+            map[profileID.uuidString] = modelID
+        } else {
+            map.removeValue(forKey: profileID.uuidString)
+        }
+        defaultModelByProfile = map
+    }
+
+    // MARK: - Recent models per profile
+
+    private var _recentModelsByProfile: [String: [String]]
+    var recentModelsByProfile: [String: [String]] {
+        get { access(keyPath: \._recentModelsByProfile); return _recentModelsByProfile }
+        set {
+            withMutation(keyPath: \._recentModelsByProfile) { _recentModelsByProfile = newValue }
+            defaults.set(newValue, forKey: Key.recentModelsByProfile)
+        }
+    }
+
+    func recentModelIDs(for profileID: UUID) -> [String] {
+        recentModelsByProfile[profileID.uuidString] ?? []
+    }
+
+    func rememberModelID(_ modelID: String, for profileID: UUID) {
+        let trimmed = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        var map = recentModelsByProfile
+        var recent = map[profileID.uuidString] ?? []
+        recent.removeAll { $0 == trimmed }
+        recent.insert(trimmed, at: 0)
+        map[profileID.uuidString] = Array(recent.prefix(8))
+        recentModelsByProfile = map
+        setDefaultModelID(trimmed, for: profileID)
+    }
+
+    // MARK: - Pinned sessions per profile
+
+    private var _pinnedSessionsByProfile: [String: [String]]
+    var pinnedSessionsByProfile: [String: [String]] {
+        get { access(keyPath: \._pinnedSessionsByProfile); return _pinnedSessionsByProfile }
+        set {
+            withMutation(keyPath: \._pinnedSessionsByProfile) { _pinnedSessionsByProfile = newValue }
+            defaults.set(newValue, forKey: Key.pinnedSessionsByProfile)
+        }
+    }
+
+    func pinnedSessionIDs(for profileID: UUID) -> [String] {
+        pinnedSessionsByProfile[profileID.uuidString] ?? []
+    }
+
+    func isSessionPinned(_ sessionID: String, for profileID: UUID) -> Bool {
+        pinnedSessionIDs(for: profileID).contains(sessionID)
+    }
+
+    func setSessionPinned(_ pinned: Bool, sessionID: String, for profileID: UUID) {
+        var map = pinnedSessionsByProfile
+        var pinnedIDs = map[profileID.uuidString] ?? []
+        pinnedIDs.removeAll { $0 == sessionID }
+        if pinned {
+            pinnedIDs.insert(sessionID, at: 0)
+        }
+        map[profileID.uuidString] = pinnedIDs
+        pinnedSessionsByProfile = map
+    }
+
+    // MARK: - Draft text per session
+
+    private var _draftTextBySession: [String: String]
+    var draftTextBySession: [String: String] {
+        get { access(keyPath: \._draftTextBySession); return _draftTextBySession }
+        set {
+            withMutation(keyPath: \._draftTextBySession) { _draftTextBySession = newValue }
+            defaults.set(newValue, forKey: Key.draftTextBySession)
+        }
+    }
+
+    func draftText(for sessionID: String) -> String {
+        draftTextBySession[sessionID] ?? ""
+    }
+
+    func setDraftText(_ draft: String, for sessionID: String) {
+        var map = draftTextBySession
+        if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            map.removeValue(forKey: sessionID)
+        } else {
+            map[sessionID] = draft
+        }
+        draftTextBySession = map
+    }
+
+    // MARK: - Helpers
+
+    private static func readUUID(_ defaults: UserDefaults, key: String) -> UUID? {
+        guard let raw = defaults.string(forKey: key) else { return nil }
+        return UUID(uuidString: raw)
+    }
+
+    private static func resolveSessionKey(_ defaults: UserDefaults) -> String {
+        if let existing = defaults.string(forKey: Key.hermesSessionKey), !existing.isEmpty {
+            return existing
+        }
+        let key = "talaria:user-\(UUID().uuidString)"
+        defaults.set(key, forKey: Key.hermesSessionKey)
+        return key
+    }
+
+    private static func readModelMap(_ defaults: UserDefaults, key: String) -> [String: String] {
+        readStringMap(defaults, key: key)
+    }
+
+    private static func readRecentModelMap(_ defaults: UserDefaults, key: String) -> [String: [String]] {
+        readStringArrayMap(defaults, key: key)
+    }
+
+    private static func readStringMap(_ defaults: UserDefaults, key: String) -> [String: String] {
+        defaults.dictionary(forKey: key) as? [String: String] ?? [:]
+    }
+
+    private static func readStringArrayMap(_ defaults: UserDefaults, key: String) -> [String: [String]] {
+        guard let raw = defaults.dictionary(forKey: key) else { return [:] }
+        var result: [String: [String]] = [:]
+        for (profileID, value) in raw {
+            if let strings = value as? [String] {
+                result[profileID] = strings
+            }
+        }
+        return result
+    }
+}
