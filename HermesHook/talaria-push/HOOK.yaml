@@ -1,0 +1,4 @@
+name: talaria-push
+description: Notify the Talaria push Worker when an agent turn completes.
+events:
+  - agent:end

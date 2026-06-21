@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
@@ -19,6 +20,7 @@ struct SettingsView: View {
                 activeServerSection
                 healthSection
                 capabilitiesSection
+                notificationsSection
                 if !skills.isEmpty { skillsSection }
                 if !toolsets.isEmpty { toolsetsSection }
                 if !appModel.activeProfile.isDashboardConfigured { dashboardNotConfiguredSection }
@@ -171,6 +173,45 @@ struct SettingsView: View {
                     }
                 }
             }
+        }
+    }
+
+    private var notificationsSection: some View {
+        Section {
+            LabeledContent("Push") {
+                if PushService.shared.isEnabled {
+                    if PushService.shared.deviceTokenHex != nil {
+                        Label("Registered", systemImage: "checkmark.circle.fill")
+                            .labelStyle(.titleAndIcon)
+                            .foregroundStyle(.green)
+                    } else {
+                        Text("Awaiting permission").foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text("Not configured").foregroundStyle(.secondary)
+                }
+            }
+
+            Button {
+                UIPasteboard.general.string = appModel.preferences.hermesSessionKey
+                appModel.haptics.success()
+            } label: {
+                LabeledContent("Push Session Key") {
+                    HStack(spacing: Spacing.xs) {
+                        Text(appModel.preferences.hermesSessionKey)
+                            .font(.caption.monospaced())
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Image(systemName: "doc.on.doc")
+                            .imageScale(.small)
+                    }
+                }
+            }
+            .tint(.primary)
+        } header: {
+            Text("Notifications")
+        } footer: {
+            Text("Set this as TALARIA_SESSION_KEY in the Hermes push hook so completion alerts reach this device. Tap to copy.")
         }
     }
 

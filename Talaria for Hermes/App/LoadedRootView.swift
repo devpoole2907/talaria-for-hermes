@@ -5,6 +5,7 @@ struct LoadedRootView: View {
     @State private var selectedSession: Session?
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var preferredCompactColumn: NavigationSplitViewColumn = .sidebar
+    private let push = PushService.shared
 
     var body: some View {
         NavigationSplitView(
@@ -52,6 +53,16 @@ struct LoadedRootView: View {
         .sensoryFeedback(.error, trigger: appModel.haptics.errorTrigger)
         .onChange(of: selectedSession) {
             preferredCompactColumn = selectedSession == nil ? .sidebar : .content
+            push.activeSessionID = selectedSession?.id
+        }
+        .onAppear { push.activeSessionID = selectedSession?.id }
+        .onChange(of: push.pendingDeepLinkSessionID) {
+            resolveDeepLink(refreshIfMissing: true)
+        }
+        .onChange(of: appModel.sessionStore.sessions) {
+            // A tap can arrive before the session list has loaded; retry once the
+            // sessions land (no refresh here — avoids a refresh→onChange loop).
+            resolveDeepLink(refreshIfMissing: false)
         }
     }
 
@@ -59,6 +70,19 @@ struct LoadedRootView: View {
         selectedSession = session
         columnVisibility = .all
         preferredCompactColumn = .content
+    }
+
+    /// Resolves a pending deep-link session id to the loaded `Session` and selects
+    /// it. If the session isn't loaded yet, optionally kicks one refresh and leaves
+    /// the id pending for the `sessions` onChange to pick up.
+    private func resolveDeepLink(refreshIfMissing: Bool) {
+        guard let id = push.pendingDeepLinkSessionID else { return }
+        if let session = appModel.sessionStore.sessions.first(where: { $0.id == id }) {
+            navigateToSession(session)
+            push.pendingDeepLinkSessionID = nil
+        } else if refreshIfMissing {
+            Task { await appModel.sessionStore.refresh() }
+        }
     }
 
     private func showTools() {

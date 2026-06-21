@@ -59,6 +59,13 @@ struct RootView: View {
             }
         }
         .task { await appModel?.start() }
+        .task {
+            // Only once a profile exists (not on the welcome screen) so the push
+            // permission prompt lands after the app is actually set up.
+            guard appModel != nil else { return }
+            PushService.shared.configure(sessionKey: preferences.hermesSessionKey)
+            await PushService.shared.requestAuthorizationAndRegister()
+        }
     }
 
     private var welcomeScreen: some View {
