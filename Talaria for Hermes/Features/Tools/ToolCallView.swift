@@ -36,7 +36,7 @@ struct ToolCallView: View {
         }
         if let output = entry.output {
             ToolPayloadSection(title: "Output", systemImage: "arrow.down.doc") {
-                ToolPayloadBody(raw: cleanToolOutput(output))
+                ToolPayloadBody(raw: ToolCallFormatting.cleanOutput(output))
             }
         } else if let progress = entry.progress?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !progress.isEmpty {
@@ -95,7 +95,7 @@ private struct ToolCallHeader: View {
         HStack(spacing: Spacing.s) {
             ToolIconBadge(name: name, isRunning: isRunning)
 
-            Text(toolDisplayName(name))
+            Text(ToolCallFormatting.displayName(name))
                 .font(.subheadline.weight(.medium))
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -170,24 +170,4 @@ private struct ToolStatusPill: View {
     private var statusColor: Color {
         isRunning ? Palette.toolRunning : Palette.toolComplete
     }
-}
-
-private func toolDisplayName(_ name: String) -> String {
-    let parts = name.components(separatedBy: "_")
-    if parts.count > 2 && parts.first == "mcp" {
-        return parts.dropFirst(2).joined(separator: "_")
-    }
-    return name
-}
-
-private func cleanToolOutput(_ raw: String) -> String {
-    var text = raw
-    if let start = text.range(of: "<untrusted_tool_result"),
-       let end = text.range(of: ">", range: start.upperBound..<text.endIndex) {
-        text = String(text[end.upperBound...])
-    }
-    if text.hasSuffix("</untrusted_tool_result>") {
-        text = String(text.dropLast("</untrusted_tool_result>".count))
-    }
-    return text.trimmingCharacters(in: .whitespacesAndNewlines)
 }

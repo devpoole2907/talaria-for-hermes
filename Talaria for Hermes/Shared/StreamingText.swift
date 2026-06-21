@@ -42,9 +42,17 @@ struct StreamingText: View {
             }
             .onAppear { syncBirths(to: text) }
             .task(id: text) {
-                // Re-pause the timeline once the latest characters have finished fading.
-                try? await Task.sleep(for: .seconds(fadeDuration + 0.05))
-                settled = true
+                // Re-pause the timeline once the latest characters have finished
+                // fading. Only settle on a *completed* sleep: if the task is
+                // cancelled (text grew again, or the view was rebuilt when a tool
+                // block inserted alongside it), settling here would freeze the
+                // TimelineView mid-fade and leave the trailing glyphs stuck dim.
+                do {
+                    try await Task.sleep(for: .seconds(fadeDuration + 0.05))
+                    settled = true
+                } catch {
+                    // Cancelled — keep animating; a fresh task will settle later.
+                }
             }
         }
     }

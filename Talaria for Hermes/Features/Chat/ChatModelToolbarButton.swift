@@ -6,32 +6,32 @@ struct ChatModelToolbarButton: View {
     var action: () -> Void
 
     var body: some View {
+        // A custom-label button inside a `ToolbarItem` already gets the system's
+        // glass capsule and tap target on iOS 26 — applying `.glassEffect` here too
+        // produced a doubled-up glass look and the extra padding/maxWidth squeezed
+        // the name out of the leading nav area. Let the toolbar do the styling.
         Button(action: action) {
             HStack(spacing: Spacing.xs) {
-                Image(systemName: "cpu")
-                    .imageScale(.small)
-                    .foregroundStyle(.secondary)
+                Text(displayModelID)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
                 if isLoading {
                     ProgressView()
                         .controlSize(.small)
-                } else {
-                    Text(modelID)
-                        .font(.callout)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
                 }
+
                 Image(systemName: "chevron.down")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            .padding(.horizontal, Spacing.l)
-            .frame(minHeight: TapTarget.minimum)
-            .frame(maxWidth: 220)
-            .contentShape(.rect)
-            .glassEffect(in: .rect(cornerRadius: 22, style: .continuous))
         }
-        .buttonStyle(.plain)
         .accessibilityLabel("Select model")
-        .accessibilityValue(modelID)
+        .accessibilityValue(displayModelID)
+    }
+
+    private var displayModelID: String {
+        let trimmed = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "hermes-agent" : trimmed
     }
 }

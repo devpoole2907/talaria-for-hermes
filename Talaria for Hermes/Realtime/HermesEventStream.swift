@@ -9,7 +9,7 @@ enum HermesEventStream {
         apiKey: String,
         sessionKey: String,
         sessionID: String,
-        input: String
+        input: HermesChatInput
     ) -> AsyncThrowingStream<HermesStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
@@ -38,12 +38,13 @@ enum HermesEventStream {
         apiKey: String,
         sessionKey: String,
         sessionID: String,
-        input: String,
+        input: HermesChatInput,
         continuation: AsyncThrowingStream<HermesStreamEvent, Error>.Continuation
     ) async throws {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 60
         config.timeoutIntervalForResource = .infinity
+        config.waitsForConnectivity = false
         let session = URLSession(configuration: config)
 
         let url = baseURL.appending(path: "/api/sessions/\(sessionID)/chat/stream")
@@ -54,7 +55,7 @@ enum HermesEventStream {
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue(sessionKey, forHTTPHeaderField: "X-Hermes-Session-Key")
 
-        struct Body: Encodable { let input: String }
+        struct Body: Encodable { let input: HermesChatInput }
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
         request.httpBody = try encoder.encode(Body(input: input))

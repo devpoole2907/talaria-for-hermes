@@ -28,14 +28,14 @@ final class HermesClient {
         self.baseURL = Self.normalised(baseURL)
         self.apiKey = apiKey
         self.sessionKey = sessionKey
-        self.adminBaseURL = adminURL.map(Self.normalised) ?? Self.defaultAdminURL(for: Self.normalised(baseURL))
+        self.adminBaseURL = adminURL.map(Self.normalised)
         self.adminUsername = adminUsername
         self.adminPassword = adminPassword
 
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 60
-        config.timeoutIntervalForResource = 600
-        config.waitsForConnectivity = false
+        config.timeoutIntervalForRequest = 15
+        config.timeoutIntervalForResource = 15
+        config.waitsForConnectivity = true
         self.session = URLSession(configuration: config)
 
         let dec = JSONDecoder()
@@ -72,26 +72,33 @@ final class HermesClient {
         return response.data
     }
 
-    // MARK: - Hermes dashboard admin
+    // MARK: - Hermes dashboard admin (via the Talaria plugin facade)
+    //
+    // These go through the Talaria plugin's /admin/* endpoints rather than the
+    // raw dashboard routes. The plugin delegates to the dashboard's own handlers
+    // in-process, so the responses are byte-identical (decoders unchanged) — but
+    // the path the app depends on is stable and version-resilient. A missing or
+    // outdated plugin surfaces as .notFound (404) / HTTP 501, which callers use
+    // to show a "plugin not configured" state. See HermesPlugin.adminPath.
 
     func dashboardCurrentModel() async throws -> HermesDashboardModel {
-        try await adminRootGet("/api/model/info")
+        try await adminRootGet(HermesPlugin.adminPath("model/info"))
     }
 
     func dashboardModelCatalog() async throws -> HermesModelCatalogResponse {
-        try await adminRootGet("/api/model/options")
+        try await adminRootGet(HermesPlugin.adminPath("model/options"))
     }
 
     func dashboardConfig() async throws -> HermesDashboardConfigResponse {
-        try await adminRootGet("/api/config")
+        try await adminRootGet(HermesPlugin.adminPath("config"))
     }
 
     func dashboardSkills() async throws -> [SkillInfo] {
-        try await adminRootGet("/api/skills")
+        try await adminRootGet(HermesPlugin.adminPath("skills"))
     }
 
     func dashboardToolsets() async throws -> [ToolsetInfo] {
-        try await adminRootGet("/api/tools/toolsets")
+        try await adminRootGet(HermesPlugin.adminPath("toolsets"))
     }
 
     func switchDashboardModel(modelID: String, provider: String?) async throws -> HermesModelAssignmentResponse {
@@ -103,7 +110,7 @@ final class HermesClient {
 
         let pinnedProvider = provider?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return try await adminRootPost(
-            "/api/model/set",
+            HermesPlugin.adminPath("model/set"),
             body: Body(
                 scope: "main",
                 provider: pinnedProvider.isEmpty ? "auto" : pinnedProvider,
@@ -150,6 +157,58 @@ final class HermesClient {
         return response.data
     }
 
+    // MARK: - Attachments (Talaria plugin, dashboard surface)
+
+    /// Uploads a document to the Talaria plugin, which stores it on the Hermes
+    /// host and returns its absolute on-disk path. The caller references that
+    /// path in a chat turn so the agent's `read_file` / `web_extract` tools can
+    /// read it. Requires the dashboard admin credentials (same as model admin).
+    func uploadAttachment(
+        data: Data,
+        filename: String,
+        contentType: String?,
+        sessionID: String?
+    ) async throws -> TalariaAttachment {
+        guard let adminBaseURL else { throw HermesError.invalidURL }
+        try await ensureAdminLogin()
+
+        let boundary = "talaria.\(UUID().uuidString)"
+        var request = URLRequest(url: adminBaseURL.appending(path: HermesPlugin.path("attachments")))
+        request.httpMethod = HTTPMethod.post.rawValue
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Self.multipartBody(
+            boundary: boundary,
+            fileField: "file",
+            filename: filename,
+            contentType: contentType ?? "application/octet-stream",
+            fileData: data,
+            textFields: sessionID.map { ["session_id": $0] } ?? [:]
+        )
+
+        let respData = try await performAdminRawRequest(request)
+        do {
+            return try decoder.decode(TalariaAttachment.self, from: respData)
+        } catch {
+            throw HermesError.decoding(String(describing: error))
+        }
+    }
+
+    /// Reads memory configuration from the Talaria plugin's `/memory` endpoint.
+    func pluginMemoryInfo() async throws -> PluginMemoryInfo {
+        try await adminRootGet(HermesPlugin.path("memory"))
+    }
+
+    /// Deletes a previously uploaded attachment by its plugin id.
+    func deleteAttachment(id: String) async throws {
+        guard let adminBaseURL else { throw HermesError.invalidURL }
+        try await ensureAdminLogin()
+        var request = URLRequest(url: adminBaseURL.appending(path: HermesPlugin.path("attachments/\(id)")))
+        request.httpMethod = HTTPMethod.delete.rawValue
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        _ = try await performAdminRawRequest(request)
+    }
+
     // MARK: - Runs control
 
     func stopRun(runID: String) async throws {
@@ -163,7 +222,7 @@ final class HermesClient {
 
     // MARK: - Streaming (nonisolated factories)
 
-    func sessionChatStream(sessionID: String, input: String) -> AsyncThrowingStream<HermesStreamEvent, Error> {
+    func sessionChatStream(sessionID: String, input: HermesChatInput) -> AsyncThrowingStream<HermesStreamEvent, Error> {
         HermesEventStream.make(
             baseURL: baseURL,
             apiKey: apiKey,
@@ -279,6 +338,47 @@ final class HermesClient {
         }
     }
 
+    /// Runs a fully-formed admin request, transparently re-logging-in once on a
+    /// stale cookie. Mirrors the retry in ``performAdminPathRequest`` but for
+    /// requests whose body is already set (e.g. multipart uploads).
+    private func performAdminRawRequest(_ request: URLRequest) async throws -> Data {
+        do {
+            return try await executeRequest(request)
+        } catch HermesError.unauthorized where adminLoggedIn {
+            adminLoggedIn = false
+            try await ensureAdminLogin()
+            return try await executeRequest(request)
+        }
+    }
+
+    /// Builds a `multipart/form-data` body with optional text fields and one
+    /// file part. CRLF line endings throughout, per the multipart spec.
+    private static func multipartBody(
+        boundary: String,
+        fileField: String,
+        filename: String,
+        contentType: String,
+        fileData: Data,
+        textFields: [String: String]
+    ) -> Data {
+        var body = Data()
+        func append(_ string: String) { body.append(Data(string.utf8)) }
+
+        for (name, value) in textFields {
+            append("--\(boundary)\r\n")
+            append("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n")
+            append("\(value)\r\n")
+        }
+
+        append("--\(boundary)\r\n")
+        append("Content-Disposition: form-data; name=\"\(fileField)\"; filename=\"\(filename)\"\r\n")
+        append("Content-Type: \(contentType)\r\n\r\n")
+        body.append(fileData)
+        append("\r\n")
+        append("--\(boundary)--\r\n")
+        return body
+    }
+
     private func ensureAdminLogin() async throws {
         guard !adminLoggedIn else { return }
         guard let adminBaseURL,
@@ -349,18 +449,6 @@ final class HermesClient {
         while str.hasSuffix("/") { str.removeLast() }
         if str.hasSuffix("/v1") { str = String(str.dropLast(3)) }
         return URL(string: str) ?? url
-    }
-
-    private static func defaultAdminURL(for url: URL) -> URL? {
-        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              components.scheme != nil,
-              components.host != nil
-        else { return nil }
-        components.path = ""
-        components.query = nil
-        components.fragment = nil
-        components.port = 9119
-        return components.url
     }
 
     private struct EmptyBody: Encodable {}

@@ -4,7 +4,7 @@ struct Session: Codable, Identifiable, Hashable, Sendable {
     let id: String
     var title: String?
     let source: String?
-    let model: String?
+    var model: String?
     let startedAt: Double?
     let lastActive: Double?
     let messageCount: Int?
@@ -16,6 +16,10 @@ struct Session: Codable, Identifiable, Hashable, Sendable {
 
     var displayTitle: String {
         title?.nilIfEmpty ?? preview?.nilIfEmpty ?? "Untitled session"
+    }
+
+    var displayModelID: String {
+        model?.nilIfEmpty ?? "hermes-agent"
     }
 
     var lastActiveDate: Date? {

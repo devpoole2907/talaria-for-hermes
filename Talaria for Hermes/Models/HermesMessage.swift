@@ -73,10 +73,23 @@ struct HermesMessage: Codable, Hashable, Sendable {
 struct TimelineMessage: Identifiable, Hashable, Sendable {
     let localID: UUID
     var message: HermesMessage
+    /// Raw image data for attachments sent with this message, kept locally so the
+    /// user's bubble can show thumbnails. Not persisted — lost on reload from the
+    /// server, which is fine for the live session.
+    var imageAttachments: [Data]
+    /// Filenames of non-image documents sent with this message, shown as chips in
+    /// the user's bubble. Local-only, like `imageAttachments`.
+    var fileAttachmentNames: [String]
 
-    init(message: HermesMessage) {
+    init(
+        message: HermesMessage,
+        imageAttachments: [Data] = [],
+        fileAttachmentNames: [String] = []
+    ) {
         self.localID = UUID()
         self.message = message
+        self.imageAttachments = imageAttachments
+        self.fileAttachmentNames = fileAttachmentNames
     }
 
     var id: UUID { localID }

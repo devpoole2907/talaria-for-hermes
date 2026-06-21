@@ -8,6 +8,7 @@ struct ChatToolbar: ToolbarContent {
     @Binding var showModelPicker: Bool
     var onCreateSession: () -> Void
     var onTogglePinned: () -> Void
+    var onShowTools: () -> Void = {}
 
     var body: some ToolbarContent {
         ToolbarItem(placement: .topBarLeading) {
@@ -18,10 +19,22 @@ struct ChatToolbar: ToolbarContent {
             )
         }
         ToolbarItemGroup(placement: .topBarTrailing) {
+            #if targetEnvironment(macCatalyst)
             Button("New Chat", systemImage: "square.and.pencil", action: onCreateSession)
                 .accessibilityLabel("New chat")
+            #endif
 
             Menu("Session Actions", systemImage: "ellipsis.circle") {
+                #if !targetEnvironment(macCatalyst)
+                Section {
+                    Button("New Chat", systemImage: "square.and.pencil", action: onCreateSession)
+                }
+
+                Section {
+                    Button("Tools", systemImage: "wrench.and.screwdriver", action: onShowTools)
+                }
+                #endif
+
                 Button("Rename", systemImage: "pencil", action: { showRenameAlert = true })
                 Button(
                     isPinned ? "Unpin Chat" : "Pin Chat",

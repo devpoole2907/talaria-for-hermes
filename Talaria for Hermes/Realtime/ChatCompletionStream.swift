@@ -41,6 +41,7 @@ enum ChatCompletionStream {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 60
         config.timeoutIntervalForResource = .infinity
+        config.waitsForConnectivity = false
         let session = URLSession(configuration: config)
 
         let url = baseURL.appending(path: "/v1/chat/completions")

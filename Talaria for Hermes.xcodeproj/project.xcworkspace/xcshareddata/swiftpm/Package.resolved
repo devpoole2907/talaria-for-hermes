@@ -1,5 +1,5 @@
 {
-  "originHash" : "496aeba323398df389b43149d07945189ddafa226e8dd186832a40a0c5082615",
+  "originHash" : "6663d884a85544ae6fdf6054bbdfe3ae319f309428365e33e0abf6607476e26d",
   "pins" : [
     {
       "identity" : "swift-concurrency-extras",
@@ -17,15 +17,6 @@
       "state" : {
         "revision" : "0b5c2cfaaec8d6193db206f675048eeb5ce95f71",
         "version" : "0.1.0"
-      }
-    },
-    {
-      "identity" : "textual",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/gonzalezreal/textual",
-      "state" : {
-        "revision" : "5b06b811c0f5313b6b84bbef98c635a630638c38",
-        "version" : "0.3.1"
       }
     }
   ],

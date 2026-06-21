@@ -13,6 +13,9 @@ final class AppModel {
     let preferences: AppPreferences
     let profileStore: ServerProfileStore
     let haptics: HapticFeedback
+    /// Serializes the model-set + run-start window across all chats so concurrent
+    /// turns (multi-agent workflows) can't run on each other's model. See ModelGate.
+    let modelGate = ModelGate()
 
     var serverHealth: HealthInfo?
     var capabilities: Capabilities?
@@ -39,6 +42,7 @@ final class AppModel {
 
     func start() async {
         startupError = nil
+        await LocalNetworkPermissionRequester.request()
         do {
             serverHealth = try await client.health()
         } catch {
@@ -46,9 +50,21 @@ final class AppModel {
             return
         }
         async let caps: Void = loadCapabilities()
-        async let models: Void = modelStore.refresh()
         async let sessions: Void = sessionStore.refresh()
-        _ = await (caps, models, sessions)
+        if activeProfile.isDashboardConfigured {
+            await modelStore.refresh()
+            seedDefaultModelIfNeeded()
+        }
+        _ = await (caps, sessions)
+    }
+
+    /// On first run against a profile, adopt the server's current model as the
+    /// default new chats inherit, so the picker reflects reality before the user
+    /// has explicitly picked anything.
+    private func seedDefaultModelIfNeeded() {
+        guard preferences.defaultSessionModel(for: activeProfile.id) == nil,
+              let model = modelStore.currentModel?.modelID, !model.isEmpty else { return }
+        preferences.setDefaultModelID(model, provider: modelStore.currentModel?.provider, for: activeProfile.id)
     }
 
     func switchProfile(_ newProfile: ServerProfile) async {
@@ -71,16 +87,24 @@ final class AppModel {
         if let existing = chatStores[session.id] {
             return existing
         }
+        let sessionID = session.id
         let store = ChatStore(
             client: client,
-            sessionID: session.id,
+            sessionID: sessionID,
             onRunCompleted: { [weak self] _ in
                 Task { @MainActor [weak self] in
                     await self?.sessionStore.refresh()
                 }
-            }
+            },
+            onTurnStart: { [weak self] in
+                await self?.prepareSessionModelForTurn(for: sessionID)
+            },
+            sessionModelID: { [weak self] in
+                self?.sessionModelID(for: sessionID)
+            },
+            modelGate: modelGate
         )
-        chatStores[session.id] = store
+        chatStores[sessionID] = store
         return store
     }
 
@@ -91,12 +115,63 @@ final class AppModel {
     func switchModel(modelID: String, provider: String?) async -> Bool {
         let switched = await modelStore.switchModel(modelID: modelID, provider: provider)
         if switched {
-            preferences.rememberModelID(modelID, for: activeProfile.id)
+            preferences.rememberModelID(modelID, provider: provider, for: activeProfile.id)
             haptics.success()
         } else {
             haptics.error()
         }
         return switched
+    }
+
+    // MARK: - Per-session model
+    //
+    // Hermes has a single global model but resolves it *fresh at the start of
+    // each turn* (verified live — the earlier "sticky session" finding was a
+    // history-parroting artifact). So a session can run any model: we record the
+    // model the user picked for it and re-apply it as the global right before each
+    // of its turns. Picking a model from the toolbar therefore changes both the
+    // global default (what new chats inherit) and the current session.
+
+    /// The model to display for a chat: the one chosen for it, else the default
+    /// new chats inherit (the last model you explicitly picked), else the live
+    /// global. Deliberately NOT the live global first — running an existing chat
+    /// reassigns the global to that chat's model, which must not change what a new
+    /// chat shows.
+    func sessionModelID(for sessionID: String) -> String {
+        preferences.sessionModel(for: sessionID)?.model
+            ?? preferences.defaultSessionModel(for: activeProfile.id)?.model
+            ?? modelStore.displayModelID
+    }
+
+    /// Prepares the server's model for a turn of `sessionID` and returns the model
+    /// id used (for the response label). A chat with a chosen model uses it; a new
+    /// chat adopts the default (your last picked model) and records it as its own.
+    /// Called under the kickoff gate (see `ModelGate`), so the global it sets holds
+    /// until this turn's run starts and binds it.
+    @discardableResult
+    func prepareSessionModelForTurn(for sessionID: String) async -> String? {
+        guard activeProfile.isDashboardConfigured else {
+            return preferences.sessionModel(for: sessionID)?.model
+        }
+        // The chat's own model, else the default new chats inherit.
+        if let target = preferences.sessionModel(for: sessionID)
+            ?? preferences.defaultSessionModel(for: activeProfile.id) {
+            // First turn of a new chat: pin it to the default so later default
+            // changes don't retroactively move this chat.
+            if preferences.sessionModel(for: sessionID) == nil {
+                preferences.setSessionModel(model: target.model, provider: target.provider, for: sessionID)
+            }
+            await modelStore.applyActiveModel(modelID: target.model, provider: target.provider)
+            return target.model
+        }
+        // No app-side model known yet (fresh install): adopt the live global and
+        // seed it as both this chat's model and the default for new chats.
+        await modelStore.refreshCurrentModel()
+        guard let model = modelStore.currentModel?.modelID, !model.isEmpty else { return nil }
+        let provider = modelStore.currentModel?.provider
+        preferences.setSessionModel(model: model, provider: provider, for: sessionID)
+        preferences.setDefaultModelID(model, provider: provider, for: activeProfile.id)
+        return model
     }
 
     // MARK: - Private

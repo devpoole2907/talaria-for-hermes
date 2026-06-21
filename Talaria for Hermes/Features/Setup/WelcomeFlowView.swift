@@ -5,20 +5,23 @@ enum WelcomeStep: Hashable {
 }
 
 enum SetupTarget: Identifiable {
-    case hermes
+    case hermesAPI
+    case hermesDashboard
 
     var id: String {
         switch self {
-        case .hermes: "hermes"
+        case .hermesAPI: "hermes-api"
+        case .hermesDashboard: "hermes-dashboard"
         }
     }
 }
 
-struct WelcomeServicesState {
-    var hermes: Bool
+struct WelcomeServicesState: Hashable {
+    var hermesAPI: Bool
+    var hermesDashboard: Bool
 
-    var hasAny: Bool {
-        hermes
+    var canContinue: Bool {
+        hermesAPI
     }
 }
 
@@ -92,16 +95,33 @@ struct WelcomeFlowView: View {
                         .fontWeight(.bold)
                         .multilineTextAlignment(.center)
 
-                    Text("Set up Hermes, then continue into the app.")
+                    Text("Set up Hermes API, then add Dashboard if you use it.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                 }
 
                 VStack(spacing: 12) {
-                    setupRow(icon: "sparkles.rectangle.stack", color: .accentColor,
-                             title: "Hermes", description: "Connect to your API server and dashboard",
-                             isConfigured: configuredServices.hermes) { setupTarget = .hermes }
+                    setupRow(
+                        icon: "point.3.connected.trianglepath.dotted",
+                        color: .accentColor,
+                        title: "Hermes API",
+                        description: "Chat, sessions, tools, and streaming",
+                        isConfigured: configuredServices.hermesAPI
+                    ) {
+                        setupTarget = .hermesAPI
+                    }
+
+                    setupRow(
+                        icon: "slider.horizontal.3",
+                        color: .blue,
+                        title: "Hermes Dashboard",
+                        description: "Model switching and provider settings",
+                        isConfigured: configuredServices.hermesDashboard,
+                        isEnabled: configuredServices.hermesAPI
+                    ) {
+                        setupTarget = .hermesDashboard
+                    }
                 }
             }
             .padding(32)
@@ -109,9 +129,10 @@ struct WelcomeFlowView: View {
             .frame(maxWidth: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .prominentBottomButton("Go", isDisabled: !configuredServices.hasAny) {
+        .prominentBottomButton("Go", isDisabled: !configuredServices.canContinue) {
             withAnimation { isInWelcomeFlow = false }
         }
+        .id(configuredServices)
         .navigationTitle("Choose Services")
         .navigationBarTitleDisplayMode(.inline)
     }
@@ -140,6 +161,7 @@ struct WelcomeFlowView: View {
         title: String,
         description: String,
         isConfigured: Bool,
+        isEnabled: Bool = true,
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
@@ -171,5 +193,7 @@ struct WelcomeFlowView: View {
             .glassEffect(.regular.interactive(), in: RoundedRectangle(cornerRadius: 16))
         }
         .buttonStyle(.plain)
+        .disabled(!isEnabled)
+        .opacity(isEnabled ? 1 : 0.5)
     }
 }

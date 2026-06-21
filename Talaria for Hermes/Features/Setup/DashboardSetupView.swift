@@ -1,17 +1,22 @@
 import SwiftUI
 
-struct SetupView: View {
+struct DashboardSetupView: View {
     @Environment(\.dismiss) private var dismiss
     var onComplete: (ServerProfile) throws -> Void
 
-    @State private var model = SetupModel()
+    @State private var model: DashboardSetupModel
     @State private var saveTask: Task<Void, Never>?
+
+    init(profile: ServerProfile, onComplete: @escaping (ServerProfile) throws -> Void) {
+        self.onComplete = onComplete
+        self._model = State(initialValue: DashboardSetupModel(profile: profile))
+    }
 
     var body: some View {
         NavigationStack {
             setupForm
                 .modalFormStyle(
-                    title: "Hermes API",
+                    title: "Hermes Dashboard",
                     primaryTitle: "Connect",
                     isPrimaryDisabled: !model.canSubmit,
                     isSaving: model.isValidating
@@ -27,41 +32,38 @@ struct SetupView: View {
     private var setupForm: some View {
         Form {
             Section {
-                Text("Connect Talaria to your Hermes API.")
+                Text("Connect Talaria to Hermes Dashboard.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
 
             Section {
-                ServerURLField(url: $model.urlText)
-
-                TextField("Display Name (optional)", text: $model.name)
-                    .textContentType(.organizationName)
+                ServerURLField(url: $model.urlText, title: "Dashboard address")
             } header: {
-                Text("API")
+                Text("Dashboard")
             } footer: {
                 if model.hasAttemptedSubmit && model.urlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    Label("Server address is required.", systemImage: "exclamationmark.circle.fill")
+                    Label("Dashboard address is required.", systemImage: "exclamationmark.circle.fill")
                         .foregroundStyle(.red)
                         .font(.footnote)
                 } else {
-                    Text("Enter the full Hermes API address, including port if needed. Example: http://forge.local:8642.")
+                    Text("Enter the full dashboard address, including port if needed. Example: http://forge.local:9119.")
                 }
             }
 
             Section {
-                SecureField("API Key", text: $model.apiKey)
+                TextField("Username", text: $model.username)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+
+                SecureField("Password", text: $model.password)
                     .textContentType(.password)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
             } header: {
                 Text("Authentication")
             } footer: {
-                if model.hasAttemptedSubmit && model.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    Label("API key is required.", systemImage: "exclamationmark.circle.fill")
-                        .foregroundStyle(.red)
-                        .font(.footnote)
-                }
+                Text("Leave blank if your dashboard does not require a login.")
             }
 
             ValidationErrorSection(error: model.validationError)
@@ -70,7 +72,7 @@ struct SetupView: View {
                 Section {
                     HStack {
                         ProgressView()
-                        Text("Checking connection…")
+                        Text("Checking dashboard…")
                             .foregroundStyle(.secondary)
                     }
                 }

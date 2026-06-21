@@ -10,9 +10,11 @@ final class AppPreferences {
         static let activeProfileID = "activeProfileID"
         static let hermesSessionKey = "hermesSessionKey"
         static let defaultModelByProfile = "defaultModelByProfile"
+        static let defaultModelProviderByProfile = "defaultModelProviderByProfile"
         static let recentModelsByProfile = "recentModelsByProfile"
         static let pinnedSessionsByProfile = "pinnedSessionsByProfile"
         static let draftTextBySession = "draftTextBySession"
+        static let modelBySession = "modelBySession"
     }
 
     init(defaults: UserDefaults = .standard) {
@@ -20,9 +22,11 @@ final class AppPreferences {
         self._activeProfileID = Self.readUUID(defaults, key: Key.activeProfileID)
         self._hermesSessionKey = Self.resolveSessionKey(defaults)
         self._defaultModelByProfile = Self.readModelMap(defaults, key: Key.defaultModelByProfile)
+        self._defaultModelProviderByProfile = Self.readModelMap(defaults, key: Key.defaultModelProviderByProfile)
         self._recentModelsByProfile = Self.readRecentModelMap(defaults, key: Key.recentModelsByProfile)
         self._pinnedSessionsByProfile = Self.readStringArrayMap(defaults, key: Key.pinnedSessionsByProfile)
         self._draftTextBySession = Self.readStringMap(defaults, key: Key.draftTextBySession)
+        self._modelBySession = Self.readStringDictMap(defaults, key: Key.modelBySession)
     }
 
     // MARK: - Active profile
@@ -54,18 +58,46 @@ final class AppPreferences {
         }
     }
 
+    private var _defaultModelProviderByProfile: [String: String]
+    var defaultModelProviderByProfile: [String: String] {
+        get { access(keyPath: \._defaultModelProviderByProfile); return _defaultModelProviderByProfile }
+        set {
+            withMutation(keyPath: \._defaultModelProviderByProfile) { _defaultModelProviderByProfile = newValue }
+            defaults.set(newValue, forKey: Key.defaultModelProviderByProfile)
+        }
+    }
+
     func defaultModelID(for profileID: UUID) -> String? {
         defaultModelByProfile[profileID.uuidString]
     }
 
-    func setDefaultModelID(_ modelID: String?, for profileID: UUID) {
+    /// The default model + provider new chats inherit. Changes only when the user
+    /// explicitly picks a model (not when an existing chat runs its own).
+    func defaultSessionModel(for profileID: UUID) -> SessionModel? {
+        guard let model = defaultModelByProfile[profileID.uuidString]?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !model.isEmpty
+        else { return nil }
+        let provider = defaultModelProviderByProfile[profileID.uuidString]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return SessionModel(model: model, provider: provider?.isEmpty == true ? nil : provider)
+    }
+
+    func setDefaultModelID(_ modelID: String?, provider: String? = nil, for profileID: UUID) {
         var map = defaultModelByProfile
+        var providerMap = defaultModelProviderByProfile
         if let modelID {
             map[profileID.uuidString] = modelID
+            if let provider = provider?.trimmingCharacters(in: .whitespacesAndNewlines), !provider.isEmpty {
+                providerMap[profileID.uuidString] = provider
+            } else {
+                providerMap.removeValue(forKey: profileID.uuidString)
+            }
         } else {
             map.removeValue(forKey: profileID.uuidString)
+            providerMap.removeValue(forKey: profileID.uuidString)
         }
         defaultModelByProfile = map
+        defaultModelProviderByProfile = providerMap
     }
 
     // MARK: - Recent models per profile
@@ -83,7 +115,7 @@ final class AppPreferences {
         recentModelsByProfile[profileID.uuidString] ?? []
     }
 
-    func rememberModelID(_ modelID: String, for profileID: UUID) {
+    func rememberRecentModelID(_ modelID: String, for profileID: UUID) {
         let trimmed = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         var map = recentModelsByProfile
@@ -92,7 +124,13 @@ final class AppPreferences {
         recent.insert(trimmed, at: 0)
         map[profileID.uuidString] = Array(recent.prefix(8))
         recentModelsByProfile = map
-        setDefaultModelID(trimmed, for: profileID)
+    }
+
+    func rememberModelID(_ modelID: String, provider: String? = nil, for profileID: UUID) {
+        rememberRecentModelID(modelID, for: profileID)
+        let trimmed = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        setDefaultModelID(trimmed, provider: provider, for: profileID)
     }
 
     // MARK: - Pinned sessions per profile
@@ -150,7 +188,60 @@ final class AppPreferences {
         draftTextBySession = map
     }
 
+    // MARK: - Per-session model
+
+    /// The model+provider chosen for a chat. Hermes resolves its single global
+    /// model fresh each turn, so the app re-applies this as the global before each
+    /// of the session's turns to make the session run it (see
+    /// `AppModel.prepareSessionModelForTurn`). Set from the model picker and
+    /// adopted from the global on a chat's first turn if not chosen explicitly.
+    struct SessionModel: Sendable, Equatable {
+        let model: String
+        let provider: String?
+    }
+
+    private var _modelBySession: [String: [String: String]]
+    var modelBySession: [String: [String: String]] {
+        get { access(keyPath: \._modelBySession); return _modelBySession }
+        set {
+            withMutation(keyPath: \._modelBySession) { _modelBySession = newValue }
+            defaults.set(newValue, forKey: Key.modelBySession)
+        }
+    }
+
+    func sessionModel(for sessionID: String) -> SessionModel? {
+        guard let entry = modelBySession[sessionID],
+              let model = entry["model"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !model.isEmpty
+        else { return nil }
+        let provider = entry["provider"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return SessionModel(model: model, provider: provider?.isEmpty == true ? nil : provider)
+    }
+
+    func setSessionModel(model: String, provider: String?, for sessionID: String) {
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedModel.isEmpty else { return }
+        var map = modelBySession
+        var entry: [String: String] = ["model": trimmedModel]
+        if let provider = provider?.trimmingCharacters(in: .whitespacesAndNewlines), !provider.isEmpty {
+            entry["provider"] = provider
+        }
+        map[sessionID] = entry
+        modelBySession = map
+    }
+
     // MARK: - Helpers
+
+    private static func readStringDictMap(_ defaults: UserDefaults, key: String) -> [String: [String: String]] {
+        guard let raw = defaults.dictionary(forKey: key) else { return [:] }
+        var result: [String: [String: String]] = [:]
+        for (sessionID, value) in raw {
+            if let dict = value as? [String: String] {
+                result[sessionID] = dict
+            }
+        }
+        return result
+    }
 
     private static func readUUID(_ defaults: UserDefaults, key: String) -> UUID? {
         guard let raw = defaults.string(forKey: key) else { return nil }

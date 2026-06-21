@@ -4,6 +4,8 @@ struct ModelProviderModelsView: View {
     @Environment(AppModel.self) private var appModel
 
     let group: ModelProviderGroup
+    let selectedModelID: String
+    var onSelectModel: (String, String?) async -> Bool
     var onFinish: () -> Void
 
     @State private var pendingModelID: String?
@@ -17,7 +19,7 @@ struct ModelProviderModelsView: View {
                         ModelSelectionRow(
                             title: model.id,
                             subtitle: model.subtitle,
-                            selected: model.id == appModel.modelStore.displayModelID,
+                            selected: model.id == selectedModelID,
                             isLoading: pendingModelID == model.id && appModel.modelStore.switching
                         )
                     }
@@ -40,7 +42,7 @@ struct ModelProviderModelsView: View {
     }
 
     private func select(_ model: ModelProviderModel) {
-        if model.id == appModel.modelStore.displayModelID {
+        if model.id == selectedModelID {
             onFinish()
             return
         }
@@ -48,7 +50,7 @@ struct ModelProviderModelsView: View {
         pendingModelID = model.id
         errorMessage = nil
         Task {
-            let switched = await appModel.switchModel(modelID: model.id, provider: group.provider)
+            let switched = await onSelectModel(model.id, group.provider)
             pendingModelID = nil
             if switched {
                 onFinish()

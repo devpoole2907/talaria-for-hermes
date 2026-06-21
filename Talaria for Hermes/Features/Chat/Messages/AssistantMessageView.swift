@@ -13,7 +13,7 @@ struct AssistantMessageView: View {
 
             // Ordered text/tool blocks, interleaved as they occurred.
             ForEach(turn.blocks) { block in
-                TurnBlockView(block: block)
+                TurnBlockView(block: block, modelID: turn.assistantModelID)
                     .transition(blockTransition)
             }
         }
@@ -41,6 +41,7 @@ struct AssistantMessageView: View {
 
 private struct TurnBlockView: View {
     let block: ChatTurn.Block
+    var modelID: String?
 
     var body: some View {
         switch block {
@@ -49,7 +50,7 @@ private struct TurnBlockView: View {
                 StreamingText(text: content, color: Palette.assistant)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
-                AssistantTextBubble(text: content)
+                AssistantTextBubble(text: content, modelID: modelID)
             }
         case .tool(let entry):
             ToolCallView(entry: entry)
@@ -59,14 +60,23 @@ private struct TurnBlockView: View {
 
 private struct AssistantTextBubble: View {
     let text: String
+    var modelID: String?
     @State private var copyTrigger = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             MarkdownText(source: text)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            HStack {
+            HStack(spacing: Spacing.xs) {
                 Spacer()
+                if let modelID, !modelID.isEmpty {
+                    Text(modelID)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .accessibilityLabel("Responded with \(modelID)")
+                }
                 CopyButton(text: text)
             }
         }

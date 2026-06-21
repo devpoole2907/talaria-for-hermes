@@ -36,8 +36,12 @@ struct MessageTimelineView: View {
                     }
 
                     ForEach(visibleTurns) { turn in
-                        TurnView(turn: turn, isWorking: store.working && turn.id == store.turns.last?.id)
-                            .padding(.horizontal, Spacing.l)
+                        TurnView(
+                            turn: turn,
+                            isWorking: store.working && turn.id == store.turns.last?.id,
+                            isReconnecting: store.reconnecting && turn.id == store.turns.last?.id
+                        )
+                        .padding(.horizontal, Spacing.l)
                     }
 
                     if hasNewerTurns {
@@ -101,8 +105,8 @@ struct MessageTimelineView: View {
                     }
                     .buttonStyle(.glass)
                     .tint(.accentColor)
-                    .padding(.trailing, Spacing.l)
-                    .padding(.bottom, Spacing.l + max(0, bottomPadding))
+                    .padding(.trailing, Spacing.s)
+                    .padding(.bottom, Spacing.s + max(0, bottomPadding))
                     .accessibilityLabel("Jump to latest message")
                 }
             }
@@ -162,7 +166,9 @@ struct MessageTimelineView: View {
         visibleRange = latestRange(for: store.turns.count)
         Task { @MainActor in
             await Task.yield()
-            proxy.scrollTo("bottom-sentinel", anchor: .bottom)
+            withAnimation(.smooth(duration: 0.28)) {
+                proxy.scrollTo("bottom-sentinel", anchor: .bottom)
+            }
             isAdjustingWindow = false
         }
     }

@@ -53,6 +53,12 @@ struct ChatTurn: Identifiable, Sendable {
     var assistantMessages: [TimelineMessage]
     var blocks: [Block]
 
+    /// The model that produced this turn's response, shown beside the copy button.
+    /// Accurate per-turn within a live session (the app sets the global to the
+    /// session's model before each turn). Falls back to the session's current
+    /// model for turns reloaded from the server, which doesn't persist this.
+    var assistantModelID: String?
+
     // Streaming-only (nil on finalized turns)
     var streamingThinking: String?
 
@@ -74,6 +80,9 @@ final class ChatStore {
     var timeline: [TimelineMessage] = []
     private(set) var turns: [ChatTurn] = []
     var working: Bool = false
+    /// True while recovering a turn whose live stream dropped (app suspended,
+    /// request timeout, network blip) by polling the server for the result.
+    var reconnecting: Bool = false
     var loading: Bool = false
     var lastError: HermesError?
     var currentRunID: String?
@@ -95,18 +104,53 @@ final class ChatStore {
     private var streamingLayoutTick = 0
 
     private var streamTask: Task<Void, Never>?
+    private var recoveryTask: Task<Void, Never>?
+    /// True once a run has started server-side but hasn't been finalized yet.
+    /// Drives recovery on re-entry/foreground; stays set across navigation so a
+    /// dropped stream can be picked back up.
+    private var awaitingResult = false
+    /// Reentrancy guard so only one recovery poll runs at a time.
+    private var recovering = false
+
+    /// How long to actively poll for a dropped run's result. Generous because
+    /// agent runs with tool loops can take minutes; re-entering the chat retries.
+    private static let recoveryWindow: TimeInterval = 360
 
     private let client: HermesClient
     private let onRunCompleted: @MainActor @Sendable (String) -> Void
+    /// Called at the start of each turn. Points the server's global model at this
+    /// session's chosen model (so the session uses it) and returns that model id,
+    /// which is recorded for the turn's response label. See
+    /// `AppModel.prepareSessionModelForTurn`.
+    private let onTurnStart: (@MainActor @Sendable () async -> String?)?
+    /// The session's current model id, used to label turns the server gave us back
+    /// without per-message model info (reloads). See `AppModel.sessionModelID`.
+    private let sessionModelID: (@MainActor @Sendable () -> String?)?
+    /// App-wide gate serializing the model-set + run-start window across chats, so
+    /// concurrent turns can't clobber each other's global model. See `ModelGate`.
+    private let modelGate: ModelGate?
+
+    /// Model used for each completed turn, keyed by the turn's order index. Kept
+    /// here (not on the wire message, which has no model field) so labels stay
+    /// correct across the per-turn timeline rebuilds that `runCompleted` triggers.
+    private var turnModelByIndex: [Int: String] = [:]
+    /// Model resolved for the in-flight turn (set by `onTurnStart`).
+    private var currentTurnModelID: String?
 
     init(
         client: HermesClient,
         sessionID: String,
-        onRunCompleted: @escaping @MainActor @Sendable (String) -> Void = { _ in }
+        onRunCompleted: @escaping @MainActor @Sendable (String) -> Void = { _ in },
+        onTurnStart: (@MainActor @Sendable () async -> String?)? = nil,
+        sessionModelID: (@MainActor @Sendable () -> String?)? = nil,
+        modelGate: ModelGate? = nil
     ) {
         self.client = client
         self.sessionID = sessionID
         self.onRunCompleted = onRunCompleted
+        self.onTurnStart = onTurnStart
+        self.sessionModelID = sessionModelID
+        self.modelGate = modelGate
     }
 
     // MARK: - Loading
@@ -119,6 +163,7 @@ final class ChatStore {
             let messages = try await client.messages(sessionID: sessionID)
             timeline = messages.map { TimelineMessage(message: $0) }
             rebuildTurns()
+            adoptExternalRunIfNeeded(from: messages)
         } catch {
             let mapped = HermesError(error)
             // Cancellation is routine (view churn / navigation); never surface it to the user.
@@ -129,15 +174,31 @@ final class ChatStore {
 
     // MARK: - Sending
 
-    func send(_ text: String) async {
+    func send(_ text: String, attachments: [ComposerAttachment] = []) async {
+        // Images ride inline as image_url parts; documents are uploaded to the
+        // Talaria plugin and referenced by their on-host path so the agent's
+        // read_file / web_extract tools can read them.
+        let imageData = attachments.compactMap { attachment -> Data? in
+            guard let data = attachment.data, HermesChatInput.imageMIMEType(for: data) != nil else { return nil }
+            return data
+        }
+        let fileAttachments = attachments.filter { attachment in
+            guard let data = attachment.data else { return false }
+            return HermesChatInput.imageMIMEType(for: data) == nil
+        }
         let userMsg = HermesMessage(
             id: nil, sessionId: sessionID, role: "user", content: text,
             toolCalls: nil, toolCallId: nil, toolName: nil,
             timestamp: Date.now.timeIntervalSince1970, finishReason: nil,
             reasoning: nil, reasoningContent: nil
         )
-        timeline.append(TimelineMessage(message: userMsg))
+        timeline.append(TimelineMessage(
+            message: userMsg,
+            imageAttachments: imageData,
+            fileAttachmentNames: fileAttachments.map(\.name)
+        ))
         working = true
+        reconnecting = false
         lastError = nil
         currentRunID = nil
         streamingText.removeAll()
@@ -148,46 +209,156 @@ final class ChatStore {
         currentStreamMsgID = nil
         receivedRunCompleted = false
         needsCompletionRefresh = false
+        awaitingResult = true
+        recovering = false
         rebuildTurns()
 
-        streamTask?.cancel()
-        streamTask = Task { [weak self] in
-            guard let self else { return }
-            await self.runStream(text: text)
-        }
-    }
-
-    private func runStream(text: String) async {
-        let stream = client.sessionChatStream(sessionID: sessionID, input: text)
-        var shouldRefreshAfterStream = false
+        // Upload documents before opening the stream. On failure, surface the
+        // error and abort the turn rather than sending a dangling reference.
+        var uploadIDs: [String] = []
+        var fileRefs: [String] = []
         do {
-            for try await event in stream {
-                guard !Task.isCancelled else { break }
-                await process(event)
+            for attachment in fileAttachments {
+                guard let data = attachment.data else { continue }
+                let uploaded = try await client.uploadAttachment(
+                    data: data,
+                    filename: attachment.name,
+                    contentType: nil,
+                    sessionID: sessionID
+                )
+                uploadIDs.append(uploaded.id)
+                fileRefs.append(
+                    "[Attachment \"\(uploaded.filename)\" saved on this host at \(uploaded.agentReadablePath). "
+                    + "Use read_file or web_extract to read it.]"
+                )
             }
-            shouldRefreshAfterStream = !receivedRunCompleted || needsCompletionRefresh
-        } catch is CancellationError {
-            working = false
-        } catch let hermesErr as HermesError where hermesErr == .cancelled {
-            working = false
         } catch {
             lastError = HermesError(error)
             working = false
+            awaitingResult = false
+            rebuildTurns()
+            return
         }
 
-        if shouldRefreshAfterStream {
-            let refreshed = await refreshTimelineAfterStream()
-            if !refreshed {
-                finalizeStreamingResponseIfNeeded()
+        let agentText = ([text] + fileRefs).filter { !$0.isEmpty }.joined(separator: "\n\n")
+        let input = HermesChatInput.make(text: agentText, attachments: attachments)
+
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        streamTask?.cancel()
+        streamTask = Task { [weak self] in
+            guard let self else { return }
+            await self.runStream(input: input, uploadIDs: uploadIDs)
+        }
+    }
+
+    /// Appends a local command/result exchange to the timeline without contacting
+    /// the agent — used by slash commands the app handles itself (e.g. `/status`).
+    /// The pair renders as a normal user turn with an assistant reply; it is
+    /// local-only and disappears on reload, which is fine for ephemeral commands.
+    func appendLocalExchange(command: String, result: String) {
+        let now = Date.now.timeIntervalSince1970
+        let user = HermesMessage(
+            id: nil, sessionId: sessionID, role: "user", content: command,
+            toolCalls: nil, toolCallId: nil, toolName: nil,
+            timestamp: now, finishReason: nil, reasoning: nil, reasoningContent: nil
+        )
+        let assistant = HermesMessage(
+            id: nil, sessionId: sessionID, role: "assistant", content: result,
+            toolCalls: nil, toolCallId: nil, toolName: nil,
+            timestamp: now, finishReason: "stop", reasoning: nil, reasoningContent: nil
+        )
+        timeline.append(TimelineMessage(message: user))
+        timeline.append(TimelineMessage(message: assistant))
+        rebuildTurns()
+    }
+
+    private func runStream(input: HermesChatInput, uploadIDs: [String] = []) async {
+        // Best-effort cleanup of uploaded documents once the run is fully done
+        // (this function only returns after completion or recovery), so we don't
+        // pull a file out from under an in-flight server-side read.
+        defer {
+            if !uploadIDs.isEmpty {
+                Task { [client] in
+                    for id in uploadIDs { try? await client.deleteAttachment(id: id) }
+                }
             }
         }
+        // Acquire the kickoff gate: set the global model and start the run under
+        // app-wide mutual exclusion so a concurrent chat can't clobber the global
+        // before this run binds it. Release the instant the run starts (first
+        // event) — the run's model is then frozen, so generation streams unguarded
+        // and other chats stay parallel. See ModelGate.
+        await modelGate?.acquire()
+        var gateReleased = false
+        func releaseGate() {
+            guard !gateReleased else { return }
+            gateReleased = true
+            modelGate?.release()
+        }
 
-        // Safety net: if run.completed was never received/parsed, clear the working flag.
-        if working {
+        // Point the server's global model at this session's model before the turn
+        // (Hermes resolves the model fresh each turn), and record it for the
+        // response label keyed by this turn's order index so it survives rebuilds.
+        currentTurnModelID = await onTurnStart?() ?? nil
+        if let model = currentTurnModelID {
+            turnModelByIndex[lastTurnIndex] = model
+        }
+        guard !Task.isCancelled else { releaseGate(); working = false; awaitingResult = false; return }
+
+        let stream = client.sessionChatStream(sessionID: sessionID, input: input)
+        do {
+            for try await event in stream {
+                if Task.isCancelled { releaseGate(); return }
+                await process(event)
+                // Run is accepted and its model is now bound — free the gate so the
+                // next queued chat can kick off while this one keeps streaming.
+                releaseGate()
+            }
+            releaseGate()
+        } catch {
+            releaseGate()
+            // A cancelled task means the user stopped or sent again — not a drop.
+            if Task.isCancelled {
+                working = false
+                awaitingResult = false
+                return
+            }
+            let mapped = HermesError(error)
+            // Recover only once a run actually started server-side. If the request
+            // itself failed (server down, bad URL, auth), surface it immediately —
+            // there's nothing running to reconnect to.
+            if currentRunID == nil || mapped == .unauthorized || mapped == .notFound {
+                lastError = mapped
+                working = false
+                awaitingResult = false
+                rebuildTurns()
+                return
+            }
+            // Connection dropped (timeout / app suspension / network blip). The run
+            // keeps executing on the server, so fall through and recover the result.
+        }
+
+        if receivedRunCompleted && !needsCompletionRefresh {
+            if working {
+                finalizeStreamingResponseIfNeeded()
+                working = false
+            }
+            awaitingResult = false
+            rebuildTurns()
+            return
+        }
+
+        // Stream ended without a usable completion (dropped connection, or a clean
+        // EOF mid-run). Recover the finished transcript by polling the server.
+        if currentRunID != nil || needsCompletionRefresh {
+            await recoverInterruptedRun()
+        } else {
             finalizeStreamingResponseIfNeeded()
             working = false
+            awaitingResult = false
+            rebuildTurns()
         }
-        rebuildTurns()
     }
 
     private func process(_ event: HermesStreamEvent) async {
@@ -217,7 +388,12 @@ final class ChatStore {
     func stop() {
         streamTask?.cancel()
         streamTask = nil
+        recoveryTask?.cancel()
+        recoveryTask = nil
         working = false
+        reconnecting = false
+        recovering = false
+        awaitingResult = false
         rebuildTurns()
         if let runID = currentRunID {
             Task {
@@ -229,7 +405,14 @@ final class ChatStore {
     // MARK: - Event application
 
     func apply(_ event: HermesStreamEvent) {
-        defer { rebuildTurns() }
+        var shouldMarkStreamingLayoutChanged = false
+
+        defer {
+            rebuildTurns()
+            if shouldMarkStreamingLayoutChanged {
+                markStreamingLayoutChanged(force: true)
+            }
+        }
 
         switch event {
         case .runStarted(let runID):
@@ -266,12 +449,14 @@ final class ChatStore {
             )
             liveTools.append(tool)
             liveBlocks.append(.tool(tool))
+            shouldMarkStreamingLayoutChanged = true
 
         case .toolCompleted(let msgID, let name):
             currentStreamMsgID = msgID
             if let idx = liveToolIndex(messageID: msgID, name: name) {
                 liveTools[idx].status = .completed
                 syncLiveToolBlock(liveTools[idx])
+                shouldMarkStreamingLayoutChanged = true
             }
 
         case .toolProgress(let msgID, let name, let text):
@@ -279,6 +464,7 @@ final class ChatStore {
             if let idx = liveToolIndex(messageID: msgID, name: name) {
                 liveTools[idx].progress = (liveTools[idx].progress ?? "") + text
                 syncLiveToolBlock(liveTools[idx])
+                shouldMarkStreamingLayoutChanged = true
             } else {
                 let tool = LiveTool(
                     id: "\(msgID.nilIfEmpty ?? "stream")|\(name)|\(UUID().uuidString.prefix(8))",
@@ -290,6 +476,7 @@ final class ChatStore {
                 )
                 liveTools.append(tool)
                 liveBlocks.append(.tool(tool))
+                shouldMarkStreamingLayoutChanged = true
             }
 
         case .approvalRequired, .unknown:
@@ -303,6 +490,7 @@ final class ChatStore {
             }
             lastUsage = usage
             working = false
+            awaitingResult = false
             streamingText.removeAll()
             streamingThinking.removeAll()
             liveTools.removeAll()
@@ -313,6 +501,8 @@ final class ChatStore {
         case .runFailed(let error):
             lastError = HermesError.network(error)
             working = false
+            reconnecting = false
+            awaitingResult = false
             streamingText.removeAll()
             streamingThinking.removeAll()
             liveTools.removeAll()
@@ -322,9 +512,15 @@ final class ChatStore {
 
     // MARK: - Turns
 
+    /// Order index of the most recent turn (the user message just sent).
+    private var lastTurnIndex: Int {
+        max(0, timeline.lazy.filter { $0.message.role == "user" }.count - 1)
+    }
+
     private func rebuildTurns() {
         var result: [ChatTurn] = []
         var i = 0
+        var turnIndex = 0
         while i < timeline.count {
             let msg = timeline[i]
             guard msg.message.role == "user" else { i += 1; continue }
@@ -340,6 +536,12 @@ final class ChatStore {
 
             let isLastTurn = j >= timeline.count
             let liveTurn = isLastTurn && working
+            // The model that produced this turn's reply: the one recorded when the
+            // turn ran, the in-flight model for a live turn, else the session's
+            // current model (server reloads carry no per-message model).
+            let turnModel = turnModelByIndex[turnIndex]
+                ?? (liveTurn ? currentTurnModelID : nil)
+                ?? sessionModelID?()
 
             // Ordered render blocks: for the in-flight turn use the event-ordered
             // live blocks; for finalized turns walk the timeline slice in order so
@@ -354,10 +556,12 @@ final class ChatStore {
                 userMessage: msg,
                 assistantMessages: assistantMsgs,
                 blocks: blocks,
+                assistantModelID: turnModel,
                 streamingThinking: streamThinking,
                 isSending: sending
             ))
             i = j
+            turnIndex += 1
         }
         turns = result
     }
@@ -556,6 +760,8 @@ final class ChatStore {
 
         lastUsage = usage
         working = false
+        reconnecting = false
+        awaitingResult = false
         streamingText.removeAll()
         streamingThinking.removeAll()
         liveTools.removeAll()
@@ -718,43 +924,127 @@ final class ChatStore {
         try? await Task.sleep(for: .milliseconds(14))
     }
 
-    private func refreshTimelineAfterStream() async -> Bool {
-        do {
-            let previousTimeline = timeline
-            let fallback = streamingFallbackMessage()
-            let messages = try await client.messages(sessionID: sessionID)
+    // MARK: - Recovery (dropped stream)
 
-            if let finalAssistant = messages.last(where: { $0.role == "assistant" && $0.hasVisibleContent }) {
-                seedLiveBlocksFromCompletion(messages)
-                await finishAssistantMessage(
-                    messageID: currentStreamMsgID ?? "",
-                    content: finalAssistant.content ?? "",
-                    reasoning: finalAssistant.reasoning ?? finalAssistant.reasoningContent
-                )
-            }
+    /// Resumes recovery when the chat reappears or the app returns to the
+    /// foreground while a run is still outstanding (its live stream was dropped).
+    /// Safe to call repeatedly: it no-ops unless there's an unfinished run and no
+    /// recovery is already in flight.
+    func recoverIfNeeded() {
+        guard awaitingResult, !recovering else { return }
+        recoveryTask?.cancel()
+        recoveryTask = Task { [weak self] in
+            await self?.recoverInterruptedRun()
+            self?.recoveryTask = nil
+        }
+    }
 
-            if messages.contains(where: { $0.role == "user" }) {
-                timeline = messages.map { TimelineMessage(message: $0) }
-            } else if !hasAssistantAfterLastUser {
-                timeline = previousTimeline
+    /// If another client started a run, `/messages` can show the user's prompt
+    /// before the final assistant reply has landed. We can't attach to that
+    /// stream, so adopt it as recoverable work and poll for the final transcript.
+    private func adoptExternalRunIfNeeded(from messages: [HermesMessage]) {
+        guard !working, !awaitingResult, hasPendingAssistantReply(in: messages) else { return }
+
+        awaitingResult = true
+        receivedRunCompleted = false
+        needsCompletionRefresh = true
+        currentRunID = nil
+        lastError = nil
+        recoverIfNeeded()
+    }
+
+    /// Recovers a turn whose live stream dropped before completing (app suspended,
+    /// request timeout, network blip, or external client handoff). Session-stream runs can't be re-attached —
+    /// the Runs control plane doesn't track them (`/v1/runs/{id}` 404s) — but they
+    /// keep running server-side and the finished transcript lands in `/messages`.
+    /// So poll until the assistant's reply appears, then finalize. The drop itself
+    /// is never surfaced as an error.
+    private func recoverInterruptedRun() async {
+        guard awaitingResult, !recovering else { return }
+        recovering = true
+        reconnecting = true
+        working = true
+        rebuildTurns()
+        defer {
+            recovering = false
+            reconnecting = false
+        }
+
+        let deadline = Date.now.addingTimeInterval(Self.recoveryWindow)
+        var delay: Duration = .seconds(2)
+        while Date.now < deadline {
+            if Task.isCancelled { return }
+            if let messages = try? await client.messages(sessionID: sessionID),
+               hasCompletedAssistantReply(in: messages) {
+                await finalizeFromMessages(messages)
+                return
             }
-            if let fallback, !hasAssistantAfterLastUser {
-                upsertAssistantAfterLastUser(fallback)
-            }
-            streamingText.removeAll()
-            streamingThinking.removeAll()
-            liveTools.removeAll()
-            liveBlocks.removeAll()
-            currentStreamMsgID = nil
-            receivedRunCompleted = true
-            needsCompletionRefresh = false
-            rebuildTurns()
-            onRunCompleted(sessionID)
-            return true
-        } catch {
-            lastError = HermesError(error)
+            try? await Task.sleep(for: delay)
+            delay = min(delay * 2, .seconds(8))
+        }
+
+        // Gave up actively polling. The turn stays recoverable (reopening or
+        // foregrounding the chat retries via `recoverIfNeeded()`); stop the spinner
+        // and leave a gentle, non-fatal note rather than a scary timeout error.
+        guard !receivedRunCompleted else { return }
+        working = false
+        lastError = .network("Lost the connection while the agent was still responding. Reopen the chat to load the finished reply.")
+        rebuildTurns()
+    }
+
+    /// The run is finished once a visible assistant reply exists after the last
+    /// user message. The server persists the whole transcript atomically on
+    /// completion — there are no partial assistant messages mid-run — so the
+    /// reply's presence is a reliable "done" signal.
+    private func hasCompletedAssistantReply(in messages: [HermesMessage]) -> Bool {
+        guard let lastUserIdx = messages.lastIndex(where: { $0.role == "user" }) else {
+            return messages.contains { $0.role == "assistant" && $0.hasVisibleContent }
+        }
+        let start = messages.index(after: lastUserIdx)
+        guard start < messages.endIndex else { return false }
+        return messages[start...].contains { $0.role == "assistant" && $0.hasVisibleContent }
+    }
+
+    private func hasPendingAssistantReply(in messages: [HermesMessage]) -> Bool {
+        guard let lastUserIdx = messages.lastIndex(where: { $0.role == "user" }) else {
             return false
         }
+        let start = messages.index(after: lastUserIdx)
+        guard start < messages.endIndex else { return true }
+        return !messages[start...].contains { $0.role == "assistant" && $0.hasVisibleContent }
+    }
+
+    /// Finalizes the in-flight turn from the authoritative `/messages` list.
+    /// `/messages` is the full conversation, so the timeline is replaced wholesale
+    /// (like `load()`), not reconciled. The final answer is revealed with the
+    /// usual streaming animation first so it doesn't pop in abruptly.
+    private func finalizeFromMessages(_ messages: [HermesMessage]) async {
+        if let finalAssistant = messages.last(where: { $0.role == "assistant" && $0.hasVisibleContent }) {
+            seedLiveBlocksFromCompletion(messages)
+            await finishAssistantMessage(
+                messageID: currentStreamMsgID ?? "",
+                content: finalAssistant.content ?? "",
+                reasoning: finalAssistant.reasoning ?? finalAssistant.reasoningContent
+            )
+        }
+
+        if messages.contains(where: { $0.role == "user" }) {
+            timeline = messages.map { TimelineMessage(message: $0) }
+        }
+
+        receivedRunCompleted = true
+        needsCompletionRefresh = false
+        awaitingResult = false
+        working = false
+        reconnecting = false
+        lastError = nil
+        streamingText.removeAll()
+        streamingThinking.removeAll()
+        liveTools.removeAll()
+        liveBlocks.removeAll()
+        currentStreamMsgID = nil
+        rebuildTurns()
+        onRunCompleted(sessionID)
     }
 }
 

@@ -35,6 +35,22 @@ final class SessionStore {
         return new
     }
 
+    func session(id: String) -> Session? {
+        sessions.first { $0.id == id }
+    }
+
+    @discardableResult
+    func refreshSession(id: String) async throws -> Session {
+        let refreshed = try await client.getSession(id: id)
+        upsert(refreshed)
+        return refreshed
+    }
+
+    func updateModel(_ modelID: String, for sessionID: String) {
+        guard let index = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
+        sessions[index].model = modelID
+    }
+
     func rename(_ session: Session, title: String) async throws -> Session {
         let updated = try await client.updateSession(id: session.id, title: title)
         upsert(updated)
@@ -48,7 +64,7 @@ final class SessionStore {
 
     func bumpLastActive(for sessionID: String) {
         if let index = sessions.firstIndex(where: { $0.id == sessionID }) {
-            var s = sessions[index]
+            let s = sessions[index]
             // Simulate a fresh lastActive so the session floats to the top
             // The next refresh will pull the real value from server
             sessions.remove(at: index)

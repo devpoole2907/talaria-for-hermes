@@ -4,6 +4,7 @@ struct RootView: View {
     @State private var preferences = AppPreferences()
     @State private var profileStore = ServerProfileStore()
     @State private var appModel: AppModel?
+    @State private var configuredProfile: ServerProfile?
     @State private var isInWelcomeFlow = false
     @State private var setupTarget: SetupTarget?
 
@@ -19,8 +20,12 @@ struct RootView: View {
         }
         .sheet(item: $setupTarget) { target in
             switch target {
-            case .hermes:
+            case .hermesAPI:
                 SetupView(onComplete: completeSetup)
+            case .hermesDashboard:
+                if let profile = configuredProfile ?? appModel?.activeProfile {
+                    DashboardSetupView(profile: profile, onComplete: completeDashboardSetup)
+                }
             }
         }
         .task(loadInitial)
@@ -30,7 +35,10 @@ struct RootView: View {
         WelcomeFlowView(
             isInWelcomeFlow: $isInWelcomeFlow,
             setupTarget: $setupTarget,
-            configuredServices: WelcomeServicesState(hermes: appModel != nil)
+            configuredServices: WelcomeServicesState(
+                hermesAPI: configuredProfile != nil || appModel != nil,
+                hermesDashboard: (configuredProfile ?? appModel?.activeProfile)?.isDashboardConfigured == true
+            )
         )
     }
 
@@ -42,7 +50,10 @@ struct RootView: View {
             return
         }
         let model = AppModel(profile: profile, preferences: preferences, profileStore: profileStore)
-        withAnimation { appModel = model }
+        withAnimation {
+            configuredProfile = profile
+            appModel = model
+        }
         await model.start()
     }
 
@@ -53,19 +64,29 @@ struct RootView: View {
         return profiles.first
     }
 
-    private func completeSetup(_ profile: ServerProfile) {
-        do {
-            try profileStore.save(profile)
-            preferences.activeProfileID = profile.id
-            let model = AppModel(profile: profile, preferences: preferences, profileStore: profileStore)
-            Task {
-                await model.start()
-                withAnimation {
-                    appModel = model
-                }
-            }
-        } catch {
-            // SetupView surfaces its own errors
+    private func completeSetup(_ profile: ServerProfile) throws {
+        try profileStore.save(profile)
+        preferences.activeProfileID = profile.id
+        let model = AppModel(profile: profile, preferences: preferences, profileStore: profileStore)
+        withAnimation {
+            configuredProfile = profile
+            appModel = model
+        }
+        Task {
+            await model.start()
+        }
+    }
+
+    private func completeDashboardSetup(_ profile: ServerProfile) throws {
+        try profileStore.save(profile)
+        preferences.activeProfileID = profile.id
+        let model = AppModel(profile: profile, preferences: preferences, profileStore: profileStore)
+        withAnimation {
+            configuredProfile = profile
+            appModel = model
+        }
+        Task {
+            await model.start()
         }
     }
 }

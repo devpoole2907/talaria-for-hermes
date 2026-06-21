@@ -85,6 +85,28 @@ final class ModelStore {
         }
     }
 
+    /// Quietly points the server's global model at `modelID` before a session's
+    /// turn (Hermes resolves the model fresh each turn). Unlike `switchModel`, this
+    /// drives no spinner and surfaces no error — the turn proceeds on whatever
+    /// global is set. No-ops when the global already matches.
+    func applyActiveModel(modelID: String, provider: String?) async {
+        let trimmedModelID = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedModelID.isEmpty else { return }
+        guard currentModel?.modelID != trimmedModelID else { return }
+        let trimmedProvider = provider?.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            let response = try await client.switchDashboardModel(
+                modelID: trimmedModelID,
+                provider: (trimmedProvider?.isEmpty == true) ? nil : trimmedProvider
+            )
+            if response.ok, let dashboardModel = response.dashboardModel {
+                currentModel = dashboardModel
+            }
+        } catch {
+            // Non-fatal: leave the global as-is and let the turn run.
+        }
+    }
+
     var displayModelID: String {
         currentModel?.modelID ?? "hermes-agent"
     }

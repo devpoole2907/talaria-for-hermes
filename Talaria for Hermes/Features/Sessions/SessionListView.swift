@@ -6,7 +6,6 @@ struct SessionListView: View {
 
     @Environment(AppModel.self) private var appModel
     @State private var showSettings: Bool = false
-    @State private var showServerPicker: Bool = false
     @State private var creatingError: String?
     @State private var sessionToDelete: Session?
     @State private var sessionToRename: Session?
@@ -18,10 +17,10 @@ struct SessionListView: View {
                 ContentUnavailableViews.connectionError(
                     error,
                     retry: retry,
-                    onEditServer: { showServerPicker = true }
+                    onEditServer: { showSettings = true }
                 )
             } else if appModel.serverHealth == nil {
-                LaunchScreenView(onEditServer: { showServerPicker = true })
+                LaunchScreenView(onEditServer: { showSettings = true })
             } else if appModel.sessionStore.sessions.isEmpty && !appModel.sessionStore.loading {
                 EmptySessionListView(onCreate: createSession)
             } else {
@@ -33,7 +32,6 @@ struct SessionListView: View {
         .navigationBarTitleDisplayMode(.inline)
         .refreshable(action: refresh)
         .sheet(isPresented: $showSettings) { SettingsView() }
-        .sheet(isPresented: $showServerPicker) { ServerProfilePickerSheet() }
         .alert("Couldn't create session", isPresented: errorBinding) {
             Button("OK", role: .cancel) { creatingError = nil }
         } message: {
@@ -50,10 +48,6 @@ struct SessionListView: View {
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
-        ToolbarItem(placement: .topBarLeading) {
-            Button("Servers", systemImage: "server.rack", action: { showServerPicker = true })
-                .accessibilityLabel("Switch server")
-        }
         ToolbarItem(placement: .topBarTrailing) {
             HStack {
                 Button("Settings", systemImage: "gearshape", action: { showSettings = true })

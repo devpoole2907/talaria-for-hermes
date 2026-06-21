@@ -9,6 +9,10 @@ struct ServerProfile: Codable, Identifiable, Hashable, Sendable {
     var adminUsername: String?
     var adminPassword: String?
 
+    var isDashboardConfigured: Bool {
+        adminURL != nil
+    }
+
     init(
         id: UUID = UUID(),
         name: String,
@@ -28,7 +32,11 @@ struct ServerProfile: Codable, Identifiable, Hashable, Sendable {
     }
 
     var dashboardURL: URL? {
-        adminURL ?? Self.defaultDashboardURL(for: url)
+        adminURL
+    }
+
+    var suggestedDashboardURL: URL? {
+        Self.defaultDashboardURL(for: url)
     }
 
     private static func defaultDashboardURL(for url: URL) -> URL? {
