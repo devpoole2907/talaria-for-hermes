@@ -101,6 +101,13 @@ struct ChatView: View {
             guard !newSelections.isEmpty else { return }
             Task { await loadPhotoSelections(newSelections) }
         }
+        .onAppear {
+            // `.task(id:)` is unreliable across `.id()`-driven view swaps inside
+            // NavigationSplitView (starting a new chat from within one sometimes
+            // leaves it stuck on the spinner). onAppear fires dependably on the new
+            // identity, so set the store here too — openChat is cached/idempotent.
+            if store == nil { store = appModel.openChat(for: session) }
+        }
         .task(id: session.id) { await loadStore() }
         .navigationBarTitleDisplayMode(.inline)
     }

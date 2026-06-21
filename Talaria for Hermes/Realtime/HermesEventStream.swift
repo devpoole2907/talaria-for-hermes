@@ -65,10 +65,20 @@ enum HermesEventStream {
             throw HermesError.invalidResponse
         }
         switch http.statusCode {
-        case 200..<300: break
-        case 401, 403: throw HermesError.unauthorized
-        case 404: throw HermesError.notFound
-        default: throw HermesError.httpStatus(http.statusCode, nil)
+        case 200..<300:
+            break
+        case 404:
+            throw HermesError.notFound
+        default:
+            // Preserve the response body — model/agent rejections (e.g. an
+            // unsupported model) arrive here as a 401/4xx with the real message in
+            // the body, which the chat surfaces inline. A bare 401/403 with no body
+            // is a genuine credentials problem.
+            let body = await collectErrorBody(bytes)
+            if (http.statusCode == 401 || http.statusCode == 403), body.isEmpty {
+                throw HermesError.unauthorized
+            }
+            throw HermesError.httpStatus(http.statusCode, body.isEmpty ? nil : body)
         }
 
         let decoder = JSONDecoder()
@@ -100,6 +110,21 @@ enum HermesEventStream {
         }
         // Flush a trailing event that wasn't terminated by a blank line.
         handle(line: "")
+    }
+
+    /// Reads an error response body (capped) so a failed stream request keeps the
+    /// server's message instead of collapsing to a bare status code.
+    private static func collectErrorBody(_ bytes: URLSession.AsyncBytes) async -> String {
+        var data: [UInt8] = []
+        do {
+            for try await byte in bytes {
+                data.append(byte)
+                if data.count >= 8192 { break }
+            }
+        } catch {
+            // Partial body is still useful; fall through with whatever we got.
+        }
+        return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Decodes the accumulated bytes as a UTF-8 line, dropping a trailing `\r`

@@ -30,6 +30,7 @@ struct SessionRowView: View {
                     .clipShape(.capsule)
             }
         }
+        .padding(.vertical, Spacing.s)
         .frame(minHeight: TapTarget.minimum)
         .accessibilityElement(children: .combine)
     }

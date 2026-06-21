@@ -332,6 +332,16 @@ final class ChatStore {
                 return
             }
             let mapped = HermesError(error)
+            // A server-provided failure message (e.g. an unsupported-model rejection
+            // that came back with a body) belongs inline as a chat response, not a
+            // transient alert.
+            if let inline = mapped.inlineChatMessage {
+                commitErrorResponse(inline)
+                working = false
+                awaitingResult = false
+                rebuildTurns()
+                return
+            }
             // Recover only once a run actually started server-side. If the request
             // itself failed (server down, bad URL, auth), surface it immediately —
             // there's nothing running to reconnect to.
@@ -510,7 +520,10 @@ final class ChatStore {
             onRunCompleted(sessionID)
 
         case .runFailed(let error):
-            lastError = HermesError.network(error)
+            // Surface the failure inline as an assistant error bubble (not just a
+            // transient alert) so model/run errors like "Model X is not supported"
+            // are visible in the timeline where they happened. (defer rebuilds.)
+            commitErrorResponse(error)
             working = false
             reconnecting = false
             awaitingResult = false
@@ -518,6 +531,7 @@ final class ChatStore {
             streamingThinking.removeAll()
             liveTools.removeAll()
             liveBlocks.removeAll()
+            currentStreamMsgID = nil
         }
     }
 
@@ -812,6 +826,58 @@ final class ChatStore {
         liveBlocks.removeAll()
         liveTools.removeAll()
         currentStreamMsgID = nil
+    }
+
+    /// Appends a failed run as an assistant error bubble so it's visible inline in
+    /// the timeline (rather than only a transient alert). Local-only — it clears on
+    /// reload. Callers trigger the rebuild (apply's defer, or the stream catch).
+    private func commitErrorResponse(_ message: String) {
+        timeline.append(TimelineMessage(message: HermesMessage(
+            id: nil,
+            sessionId: sessionID,
+            role: "assistant",
+            content: Self.formatErrorMessage(message),
+            toolCalls: nil,
+            toolCallId: nil,
+            toolName: nil,
+            timestamp: Date.now.timeIntervalSince1970,
+            finishReason: "error",
+            reasoning: nil,
+            reasoningContent: nil
+        )))
+        streamingText.removeAll()
+        streamingThinking.removeAll()
+        liveTools.removeAll()
+        liveBlocks.removeAll()
+        currentStreamMsgID = nil
+    }
+
+    private static func formatErrorMessage(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let detail = extractedErrorMessage(from: trimmed) ?? trimmed
+        return "⚠️ **This turn couldn't complete.**\n\n\(detail)"
+    }
+
+    /// Best-effort pull of the human-readable text out of a provider/agent error
+    /// blob like `Error code: 401 - {'type':'error','error':{'message':'Model X is
+    /// not supported'}}`, falling back to the raw string when no key is found.
+    private static func extractedErrorMessage(from raw: String) -> String? {
+        for key in ["\"message\"", "'message'", "\"detail\"", "'detail'"] {
+            guard let keyRange = raw.range(of: key) else { continue }
+            if let value = firstQuotedString(in: raw[keyRange.upperBound...]) {
+                return value
+            }
+        }
+        return nil
+    }
+
+    private static func firstQuotedString(in slice: Substring) -> String? {
+        guard let open = slice.firstIndex(where: { $0 == "'" || $0 == "\"" }) else { return nil }
+        let quote = slice[open]
+        let rest = slice[slice.index(after: open)...]
+        guard let close = rest.firstIndex(of: quote) else { return nil }
+        let value = String(rest[..<close]).trimmingCharacters(in: .whitespaces)
+        return value.isEmpty ? nil : value
     }
 
     private func finalizeStreamingResponseIfNeeded() {

@@ -63,7 +63,11 @@ final class AppModel {
     /// has explicitly picked anything.
     private func seedDefaultModelIfNeeded() {
         guard preferences.defaultSessionModel(for: activeProfile.id) == nil,
-              let model = modelStore.currentModel?.modelID, !model.isEmpty else { return }
+              let model = modelStore.currentModel?.modelID, !model.isEmpty,
+              // Never adopt a placeholder (e.g. `hermes-agent`) as the default new
+              // chats inherit — it isn't a real provider model and every turn that
+              // re-applies it would be rejected.
+              modelStore.isSelectableModel(model) else { return }
         preferences.setDefaultModelID(model, provider: modelStore.currentModel?.provider, for: activeProfile.id)
     }
 
@@ -159,6 +163,11 @@ final class AppModel {
         // The chat's own model, else the default new chats inherit.
         if let target = preferences.sessionModel(for: sessionID)
             ?? preferences.defaultSessionModel(for: activeProfile.id) {
+            // Only ever drive the server to a real, switchable model. If the stored
+            // id is a placeholder (e.g. an older session that adopted `hermes-agent`),
+            // leave the server's global untouched and let it resolve the turn rather
+            // than re-pushing an id the provider rejects every time.
+            guard modelStore.isSelectableModel(target.model) else { return nil }
             // First turn of a new chat: pin it to the default so later default
             // changes don't retroactively move this chat.
             if preferences.sessionModel(for: sessionID) == nil {
@@ -168,9 +177,11 @@ final class AppModel {
             return target.model
         }
         // No app-side model known yet (fresh install): adopt the live global and
-        // seed it as both this chat's model and the default for new chats.
+        // seed it as both this chat's model and the default for new chats — but only
+        // when it's a real model, so a placeholder global never gets locked in.
         await modelStore.refreshCurrentModel()
-        guard let model = modelStore.currentModel?.modelID, !model.isEmpty else { return nil }
+        guard let model = modelStore.currentModel?.modelID, !model.isEmpty,
+              modelStore.isSelectableModel(model) else { return nil }
         let provider = modelStore.currentModel?.provider
         preferences.setSessionModel(model: model, provider: provider, for: sessionID)
         preferences.setDefaultModelID(model, provider: provider, for: activeProfile.id)

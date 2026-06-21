@@ -4,9 +4,11 @@ struct MessageTimelineView: View {
     let store: ChatStore
     var bottomPadding: CGFloat = 0
 
-    private let initialWindowSize = 80
-    private let turnBatchSize = 40
-    private let maximumWindowSize = 160
+    // Eager VStack (LazyVStack breaks programmatic ScrollView control), so the
+    // window is the only thing bounding render cost — keep it tight.
+    private let initialWindowSize = 30
+    private let turnBatchSize = 20
+    private let maximumWindowSize = 60
 
     @State private var isPinnedToBottom: Bool = true
     @State private var visibleRange: Range<Int> = 0..<0
@@ -100,11 +102,10 @@ struct MessageTimelineView: View {
                         jumpToLatest(proxy: proxy)
                     } label: {
                         Image(systemName: "arrow.down")
-                            .font(.headline.weight(.semibold))
-                            .frame(width: 40, height: 40)
+                            .font(.subheadline.weight(.semibold))
+                            .frame(width: 32, height: 32)
                     }
                     .buttonStyle(.glass)
-                    .tint(.accentColor)
                     .padding(.trailing, Spacing.s)
                     .padding(.bottom, Spacing.s + max(0, bottomPadding))
                     .accessibilityLabel("Jump to latest message")
@@ -189,16 +190,27 @@ struct MessageTimelineView: View {
             return
         }
 
-        if isPinnedToBottom {
-            let currentSize = normalizedRange(for: oldCount).count
-            let nextSize = min(maximumWindowSize, max(initialWindowSize, currentSize + (newCount - oldCount)))
-            visibleRange = max(0, newCount - nextSize)..<newCount
-            Task { @MainActor in
-                await Task.yield()
-                proxy.scrollTo("bottom-sentinel", anchor: .bottom)
-            }
-        } else {
-            visibleRange = normalizedRange(for: newCount)
+        // A new turn was appended at the end. If the user is sending (or already at
+        // the bottom), snap to a fresh window pinned to the bottom — otherwise a
+        // message sent while scrolled up lands below the window and looks like it
+        // vanished. Use a tight window (latestRange) rather than growing it, so the
+        // timeline stays light as the conversation gets long.
+        if newCount > oldCount, store.working || isPinnedToBottom {
+            isPinnedToBottom = true
+            visibleRange = latestRange(for: newCount)
+            scrollToBottom(proxy)
+            return
+        }
+
+        // Content changed while the user is reading older messages: keep their
+        // place, just clamp the window to the new bounds.
+        visibleRange = normalizedRange(for: newCount)
+    }
+
+    private func scrollToBottom(_ proxy: ScrollViewProxy) {
+        Task { @MainActor in
+            await Task.yield()
+            proxy.scrollTo("bottom-sentinel", anchor: .bottom)
         }
     }
 

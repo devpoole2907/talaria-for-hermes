@@ -79,6 +79,26 @@ enum ModelProviderCatalog {
         }
     }
 
+    /// The set of model ids the server actually advertises (provider + config
+    /// catalogs only — deliberately excludes the synthesized "current"/"recent"
+    /// entries that `groups` adds). Lets callers tell a real, switchable model from
+    /// a placeholder like `hermes-agent`. Empty when no catalog is available, in
+    /// which case absence shouldn't be read as "invalid".
+    static func catalogModelIDs(
+        modelCatalog: HermesModelCatalogResponse?,
+        config: HermesDashboardConfigResponse?
+    ) -> Set<String> {
+        var ids: Set<String> = []
+        let collect: (String, (id: String, name: String, provider: String?, subtitle: String), String?) -> Void = { modelID, _, _ in
+            let trimmed = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            ids.insert(trimmed)
+        }
+        addPluginCatalog(modelCatalog, addResolvedModel: collect)
+        addConfigCatalog(config, addResolvedModel: collect)
+        return ids
+    }
+
     private static func addPluginCatalog(
         _ catalog: HermesModelCatalogResponse?,
         addResolvedModel: (String, (id: String, name: String, provider: String?, subtitle: String), String?) -> Void

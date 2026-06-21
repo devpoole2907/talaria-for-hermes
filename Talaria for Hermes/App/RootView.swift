@@ -1,12 +1,42 @@
 import SwiftUI
 
 struct RootView: View {
-    @State private var preferences = AppPreferences()
-    @State private var profileStore = ServerProfileStore()
+    @State private var preferences: AppPreferences
+    @State private var profileStore: ServerProfileStore
     @State private var appModel: AppModel?
     @State private var configuredProfile: ServerProfile?
-    @State private var isInWelcomeFlow = false
+    @State private var isInWelcomeFlow: Bool
     @State private var setupTarget: SetupTarget?
+
+    init() {
+        let preferences = AppPreferences()
+        let profileStore = ServerProfileStore()
+        _preferences = State(initialValue: preferences)
+        _profileStore = State(initialValue: profileStore)
+
+        // Resolve the active profile synchronously (it's a local keychain read) and
+        // build the AppModel up front, so the very first frame is the real Sessions
+        // UI rather than a full-screen launch gate. `start()` (the network health +
+        // session fetch) then runs in `.task`, surfaced as the inline spinner inside
+        // the Sessions screen.
+        let profiles = (try? profileStore.loadAll()) ?? []
+        let active: ServerProfile?
+        if let id = preferences.activeProfileID, let match = profiles.first(where: { $0.id == id }) {
+            active = match
+        } else {
+            active = profiles.first
+        }
+        if let active {
+            _appModel = State(initialValue: AppModel(profile: active, preferences: preferences, profileStore: profileStore))
+            _configuredProfile = State(initialValue: active)
+            _isInWelcomeFlow = State(initialValue: false)
+        } else {
+            _appModel = State(initialValue: nil)
+            _configuredProfile = State(initialValue: nil)
+            _isInWelcomeFlow = State(initialValue: true)
+        }
+        _setupTarget = State(initialValue: nil)
+    }
 
     var body: some View {
         Group {
@@ -28,7 +58,7 @@ struct RootView: View {
                 }
             }
         }
-        .task(loadInitial)
+        .task { await appModel?.start() }
     }
 
     private var welcomeScreen: some View {
@@ -40,28 +70,6 @@ struct RootView: View {
                 hermesDashboard: (configuredProfile ?? appModel?.activeProfile)?.isDashboardConfigured == true
             )
         )
-    }
-
-    @Sendable
-    private func loadInitial() async {
-        let profiles = (try? profileStore.loadAll()) ?? []
-        guard let profile = resolveActive(among: profiles) else {
-            withAnimation { isInWelcomeFlow = true }
-            return
-        }
-        let model = AppModel(profile: profile, preferences: preferences, profileStore: profileStore)
-        withAnimation {
-            configuredProfile = profile
-            appModel = model
-        }
-        await model.start()
-    }
-
-    private func resolveActive(among profiles: [ServerProfile]) -> ServerProfile? {
-        if let id = preferences.activeProfileID, let match = profiles.first(where: { $0.id == id }) {
-            return match
-        }
-        return profiles.first
     }
 
     private func completeSetup(_ profile: ServerProfile) throws {

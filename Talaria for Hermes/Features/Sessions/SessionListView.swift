@@ -19,10 +19,15 @@ struct SessionListView: View {
                     retry: retry,
                     onEditServer: { showSettings = true }
                 )
-            } else if appModel.serverHealth == nil {
-                LaunchScreenView(onEditServer: { showSettings = true })
-            } else if appModel.sessionStore.sessions.isEmpty && !appModel.sessionStore.loading {
-                EmptySessionListView(onCreate: createSession)
+            } else if appModel.sessionStore.sessions.isEmpty {
+                if appModel.serverHealth == nil || appModel.sessionStore.loading {
+                    // Still connecting / loading sessions: keep the Sessions screen
+                    // and its toolbar on screen with an inline spinner instead of
+                    // taking over the whole window with the launch screen.
+                    loadingPlaceholder
+                } else {
+                    EmptySessionListView(onCreate: createSession)
+                }
             } else {
                 sessionList
             }
@@ -54,6 +59,16 @@ struct SessionListView: View {
                 Button("New Session", systemImage: "plus", action: createSession)
             }
         }
+    }
+
+    private var loadingPlaceholder: some View {
+        VStack(spacing: Spacing.m) {
+            ProgressView()
+            Text("Loading sessions…")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var sessionList: some View {

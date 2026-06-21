@@ -38,6 +38,19 @@ enum HermesError: Error, LocalizedError, Equatable, Sendable {
         }
     }
 
+    /// A server-provided failure message worth showing inline in the chat timeline
+    /// (model/agent rejections that came back with a body), or nil when the failure
+    /// is a transport/auth problem better surfaced as a connection alert.
+    var inlineChatMessage: String? {
+        switch self {
+        case .httpStatus(_, let body):
+            guard let body, !body.isEmpty else { return nil }
+            return body
+        default:
+            return nil
+        }
+    }
+
     init(_ underlying: Error) {
         if let mapped = underlying as? HermesError {
             self = mapped

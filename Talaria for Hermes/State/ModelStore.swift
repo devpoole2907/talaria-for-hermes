@@ -108,6 +108,31 @@ final class ModelStore {
     }
 
     var displayModelID: String {
-        currentModel?.modelID ?? "hermes-agent"
+        currentModel?.modelID ?? Self.placeholderModelID
+    }
+
+    /// Hermes' logical agent name. It is NOT a provider model id — pushing it to
+    /// the model-set endpoint makes the upstream provider reject the turn ("Model
+    /// hermes-agent is not supported"). Used only as a display fallback.
+    static let placeholderModelID = "hermes-agent"
+
+    /// Model ids the server actually advertises (real provider/config catalog).
+    /// Empty when no catalog has loaded yet.
+    var knownModelIDs: Set<String> {
+        ModelProviderCatalog.catalogModelIDs(modelCatalog: modelCatalog, config: dashboardConfig)
+    }
+
+    /// Whether `modelID` is a real, switchable model worth pushing to the server.
+    /// The placeholder is never selectable. Otherwise we allow it when we have no
+    /// catalog to check against (don't block in the dark) and require membership
+    /// once a catalog is loaded.
+    func isSelectableModel(_ modelID: String) -> Bool {
+        let trimmed = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed.caseInsensitiveCompare(Self.placeholderModelID) != .orderedSame
+        else { return false }
+        let known = knownModelIDs
+        guard !known.isEmpty else { return true }
+        return known.contains(trimmed)
     }
 }
