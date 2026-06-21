@@ -91,12 +91,12 @@ struct ChatView: View {
             renameText = currentSession.title ?? ""
         }
         .photosPicker(isPresented: $showPhotoPicker, selection: $photoSelections, matching: .images)
-        .fileImporter(
-            isPresented: $showFilePicker,
-            allowedContentTypes: [.item],
-            allowsMultipleSelection: true,
-            onCompletion: handleFileImport
-        )
+        .background {
+            DocumentPicker(
+                isPresented: $showFilePicker,
+                onPick: { urls in attachFiles(at: urls) }
+            )
+        }
         .onChange(of: photoSelections) { _, newSelections in
             guard !newSelections.isEmpty else { return }
             Task { await loadPhotoSelections(newSelections) }
@@ -106,26 +106,67 @@ struct ChatView: View {
     }
 
     private func loadPhotoSelections(_ selections: [PhotosPickerItem]) async {
+        var failures: [String] = []
         for item in selections {
-            let data = try? await item.loadTransferable(type: Data.self)
-            let name = item.itemIdentifier ?? "Photo \(attachments.count + 1)"
-            attachments.append(ComposerAttachment(name: name, kind: .photo, data: data))
+            do {
+                guard let raw = try await item.loadTransferable(type: Data.self) else {
+                    failures.append(loadErrorDetail("photo returned no data"))
+                    continue
+                }
+                // Downscale before it rides inline as base64, or full-res photos
+                // blow past the server's body limit (HTTP 413). Falls back to raw if
+                // the bytes aren't a decodable image.
+                let data = ImageDownscaler.prepareForUpload(raw) ?? raw
+                let name = item.itemIdentifier ?? "Photo \(attachments.count + 1)"
+                attachments.append(ComposerAttachment(name: name, kind: .photo, data: data))
+            } catch {
+                failures.append(error.localizedDescription)
+            }
         }
         photoSelections = []
+        if !failures.isEmpty {
+            errorMessage = "Couldn't load \(failures.count == 1 ? "the photo" : "\(failures.count) photos"): \(failures.joined(separator: "; "))"
+        }
     }
 
-    private func handleFileImport(_ result: Result<[URL], Error>) {
-        switch result {
-        case .success(let urls):
-            for url in urls {
-                let needsStop = url.startAccessingSecurityScopedResource()
-                defer { if needsStop { url.stopAccessingSecurityScopedResource() } }
-                let data = try? Data(contentsOf: url)
+    private func loadErrorDetail(_ fallback: String) -> String {
+        #if targetEnvironment(macCatalyst)
+        return "\(fallback) (macOS). Check the app's Photos access in System Settings › Privacy."
+        #else
+        return fallback
+        #endif
+    }
+
+    private func attachFiles(at urls: [URL]) {
+        var failed: [String] = []
+        for url in urls {
+            if let data = readPickedFile(at: url) {
                 attachments.append(ComposerAttachment(name: url.lastPathComponent, kind: .file, data: data))
+            } else {
+                // Don't append a dataless attachment: it would show a chip that
+                // silently drops on send (the upload filter needs non-nil data).
+                failed.append(url.lastPathComponent)
             }
-        case .failure(let error):
-            errorMessage = error.localizedDescription
         }
+        if !failed.isEmpty {
+            errorMessage = "Couldn't read \(failed.joined(separator: ", ")). If it's in iCloud Drive, open it once to download it, then try again."
+        }
+    }
+
+    /// Reads a picked file's bytes. Picker URLs are security-scoped, and iCloud /
+    /// third-party provider files need a coordinated read (and may need downloading
+    /// first), so a plain `Data(contentsOf:)` can return nil for them. Coordinate
+    /// the read so those cases work instead of silently failing.
+    private func readPickedFile(at url: URL) -> Data? {
+        let needsStop = url.startAccessingSecurityScopedResource()
+        defer { if needsStop { url.stopAccessingSecurityScopedResource() } }
+
+        var coordinatorError: NSError?
+        var data: Data?
+        NSFileCoordinator().coordinate(readingItemAt: url, options: [.withoutChanges], error: &coordinatorError) { readURL in
+            data = try? Data(contentsOf: readURL)
+        }
+        return data
     }
 
     private var errorBinding: Binding<Bool> {

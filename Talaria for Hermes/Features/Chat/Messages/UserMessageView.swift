@@ -57,8 +57,8 @@ private struct UserFileAttachmentsView: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
-                .padding(.horizontal, Spacing.s)
-                .padding(.vertical, Spacing.xs)
+                .padding(.horizontal, Spacing.m)
+                .padding(.vertical, Spacing.s)
                 .frame(maxWidth: 240, alignment: .leading)
                 .background(Palette.user.opacity(0.18))
                 .clipShape(.rect(cornerRadius: Radii.large))

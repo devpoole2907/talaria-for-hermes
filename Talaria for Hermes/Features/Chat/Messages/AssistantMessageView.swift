@@ -47,7 +47,7 @@ private struct TurnBlockView: View {
         switch block {
         case .text(_, let content, let isStreaming):
             if isStreaming {
-                StreamingText(text: content, color: Palette.assistant)
+                StreamingMarkdownText(text: content, color: Palette.assistant)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 AssistantTextBubble(text: content, modelID: modelID)

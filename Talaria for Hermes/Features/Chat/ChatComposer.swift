@@ -228,8 +228,8 @@ private struct AttachmentChip: View {
             }
             .accessibilityLabel("Remove \(attachment.name)")
         }
-        .padding(.horizontal, Spacing.s)
-        .padding(.vertical, Spacing.xs)
+        .padding(.horizontal, Spacing.m)
+        .padding(.vertical, Spacing.s)
         .frame(maxWidth: 200)
         .glassEffect(in: .capsule)
     }

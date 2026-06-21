@@ -7,6 +7,60 @@ import SwiftUI
 /// Only the trailing (still-fading) characters are rendered per-glyph; everything
 /// before them is emitted as a single opaque run, so per-frame cost stays small
 /// even for long messages.
+/// Streaming assistant text that renders markdown *progressively* instead of
+/// snapping the whole reply from plain text to formatted markdown at the end.
+///
+/// As the reply streams, every paragraph that's complete (ends at a blank line and
+/// isn't inside an open ``` code fence) is committed to fully-rendered markdown.
+/// Only the still-arriving trailing paragraph renders as plain fading text. So the
+/// big end-of-message reflow becomes a series of small per-paragraph commits.
+struct StreamingMarkdownText: View {
+    let text: String
+    var color: Color = .primary
+
+    var body: some View {
+        let boundary = Self.commitBoundary(in: text)
+        let committed = String(text[..<boundary])
+        let tail = String(text[boundary...])
+
+        VStack(alignment: .leading, spacing: Spacing.s) {
+            if !committed.isEmpty {
+                MarkdownText(source: committed)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if !tail.isEmpty {
+                StreamingText(text: tail, color: color)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    /// Index just past the last blank-line ("\n\n") boundary whose preceding text
+    /// has balanced code fences — so we never commit a half-open ``` block to
+    /// markdown. `startIndex` when there's no safe boundary yet (all plain).
+    private static func commitBoundary(in text: String) -> String.Index {
+        var boundary = text.startIndex
+        var searchStart = text.startIndex
+        while let range = text.range(of: "\n\n", range: searchStart..<text.endIndex) {
+            if fencesBalanced(in: text[..<range.upperBound]) {
+                boundary = range.upperBound
+            }
+            searchStart = range.upperBound
+        }
+        return boundary
+    }
+
+    private static func fencesBalanced(in slice: Substring) -> Bool {
+        var count = 0
+        var idx = slice.startIndex
+        while let range = slice.range(of: "```", range: idx..<slice.endIndex) {
+            count += 1
+            idx = range.upperBound
+        }
+        return count.isMultiple(of: 2)
+    }
+}
+
 struct StreamingText: View {
     let text: String
     var color: Color = .primary

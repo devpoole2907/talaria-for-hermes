@@ -123,9 +123,13 @@ final class ChatStore {
     /// which is recorded for the turn's response label. See
     /// `AppModel.prepareSessionModelForTurn`.
     private let onTurnStart: (@MainActor @Sendable () async -> String?)?
-    /// The session's current model id, used to label turns the server gave us back
-    /// without per-message model info (reloads). See `AppModel.sessionModelID`.
-    private let sessionModelID: (@MainActor @Sendable () -> String?)?
+    /// Persists the model that produced a turn, keyed by the turn's order index, so
+    /// the response label survives reloads and never re-labels when the chat's model
+    /// is switched. See `AppPreferences.setTurnModel`.
+    private let persistTurnModel: (@MainActor @Sendable (Int, String) -> Void)?
+    /// Looks up the persisted model for a turn index (set on prior runs). Used to
+    /// label turns the server gave back without per-message model info (reloads).
+    private let turnModelForIndex: (@MainActor @Sendable (Int) -> String?)?
     /// App-wide gate serializing the model-set + run-start window across chats, so
     /// concurrent turns can't clobber each other's global model. See `ModelGate`.
     private let modelGate: ModelGate?
@@ -142,14 +146,16 @@ final class ChatStore {
         sessionID: String,
         onRunCompleted: @escaping @MainActor @Sendable (String) -> Void = { _ in },
         onTurnStart: (@MainActor @Sendable () async -> String?)? = nil,
-        sessionModelID: (@MainActor @Sendable () -> String?)? = nil,
+        persistTurnModel: (@MainActor @Sendable (Int, String) -> Void)? = nil,
+        turnModelForIndex: (@MainActor @Sendable (Int) -> String?)? = nil,
         modelGate: ModelGate? = nil
     ) {
         self.client = client
         self.sessionID = sessionID
         self.onRunCompleted = onRunCompleted
         self.onTurnStart = onTurnStart
-        self.sessionModelID = sessionModelID
+        self.persistTurnModel = persistTurnModel
+        self.turnModelForIndex = turnModelForIndex
         self.modelGate = modelGate
     }
 
@@ -303,6 +309,7 @@ final class ChatStore {
         currentTurnModelID = await onTurnStart?() ?? nil
         if let model = currentTurnModelID {
             turnModelByIndex[lastTurnIndex] = model
+            persistTurnModel?(lastTurnIndex, model)
         }
         guard !Task.isCancelled else { releaseGate(); working = false; awaitingResult = false; return }
 
@@ -390,6 +397,10 @@ final class ChatStore {
         streamTask = nil
         recoveryTask?.cancel()
         recoveryTask = nil
+        // Commit whatever streamed so far *before* dropping out of the live state,
+        // or the partial reply (which lives only in ephemeral streaming state until
+        // a completion event) disappears instead of freezing in place.
+        commitPartialResponseOnStop()
         working = false
         reconnecting = false
         recovering = false
@@ -537,11 +548,13 @@ final class ChatStore {
             let isLastTurn = j >= timeline.count
             let liveTurn = isLastTurn && working
             // The model that produced this turn's reply: the one recorded when the
-            // turn ran, the in-flight model for a live turn, else the session's
-            // current model (server reloads carry no per-message model).
+            // turn ran (this run or persisted from a prior one), or the in-flight
+            // model for a live turn. Deliberately NOT the session's *current* model —
+            // that would relabel earlier replies whenever the chat's model is
+            // switched. Turns with no record (legacy history) simply show no label.
             let turnModel = turnModelByIndex[turnIndex]
+                ?? turnModelForIndex?(turnIndex)
                 ?? (liveTurn ? currentTurnModelID : nil)
-                ?? sessionModelID?()
 
             // Ordered render blocks: for the in-flight turn use the event-ordered
             // live blocks; for finalized turns walk the timeline slice in order so
@@ -769,6 +782,36 @@ final class ChatStore {
         currentStreamMsgID = nil
         rebuildTurns()
         onRunCompleted(sessionID)
+    }
+
+    /// Freezes the partial reply when the user taps stop: commits the text/reasoning
+    /// streamed so far as the turn's assistant message (marked finished, so it
+    /// renders as a normal bubble) instead of letting it vanish with the live state.
+    /// No-ops if there's already a committed assistant reply or nothing streamed yet.
+    private func commitPartialResponseOnStop() {
+        guard !hasAssistantAfterLastUser else { return }
+        let content = activeStreamingText
+        let reasoning = activeStreamingThinking
+        guard content?.isEmpty == false || reasoning?.isEmpty == false else { return }
+
+        upsertAssistantAfterLastUser(HermesMessage(
+            id: nil,
+            sessionId: sessionID,
+            role: "assistant",
+            content: content,
+            toolCalls: nil,
+            toolCallId: nil,
+            toolName: nil,
+            timestamp: Date.now.timeIntervalSince1970,
+            finishReason: "stop",
+            reasoning: reasoning,
+            reasoningContent: reasoning
+        ))
+        streamingText.removeAll()
+        streamingThinking.removeAll()
+        liveBlocks.removeAll()
+        liveTools.removeAll()
+        currentStreamMsgID = nil
     }
 
     private func finalizeStreamingResponseIfNeeded() {

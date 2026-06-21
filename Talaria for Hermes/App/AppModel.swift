@@ -99,8 +99,11 @@ final class AppModel {
             onTurnStart: { [weak self] in
                 await self?.prepareSessionModelForTurn(for: sessionID)
             },
-            sessionModelID: { [weak self] in
-                self?.sessionModelID(for: sessionID)
+            persistTurnModel: { [weak self] index, model in
+                self?.preferences.setTurnModel(model, at: index, for: sessionID)
+            },
+            turnModelForIndex: { [weak self] index in
+                self?.preferences.turnModel(at: index, for: sessionID)
             },
             modelGate: modelGate
         )

@@ -15,6 +15,7 @@ final class AppPreferences {
         static let pinnedSessionsByProfile = "pinnedSessionsByProfile"
         static let draftTextBySession = "draftTextBySession"
         static let modelBySession = "modelBySession"
+        static let turnModelsBySession = "turnModelsBySession"
     }
 
     init(defaults: UserDefaults = .standard) {
@@ -27,6 +28,7 @@ final class AppPreferences {
         self._pinnedSessionsByProfile = Self.readStringArrayMap(defaults, key: Key.pinnedSessionsByProfile)
         self._draftTextBySession = Self.readStringMap(defaults, key: Key.draftTextBySession)
         self._modelBySession = Self.readStringDictMap(defaults, key: Key.modelBySession)
+        self._turnModelsBySession = Self.readStringArrayMap(defaults, key: Key.turnModelsBySession)
     }
 
     // MARK: - Active profile
@@ -228,6 +230,41 @@ final class AppPreferences {
         }
         map[sessionID] = entry
         modelBySession = map
+    }
+
+    // MARK: - Per-turn model
+
+    /// The model that produced each turn's response, indexed by the turn's order
+    /// position in the conversation. Recorded when a turn runs so the label beside
+    /// the copy button stays pinned to the model that actually generated it —
+    /// switching the chat's model must never relabel earlier replies, and these
+    /// survive reloads (the server doesn't persist per-message model info).
+    private var _turnModelsBySession: [String: [String]]
+    var turnModelsBySession: [String: [String]] {
+        get { access(keyPath: \._turnModelsBySession); return _turnModelsBySession }
+        set {
+            withMutation(keyPath: \._turnModelsBySession) { _turnModelsBySession = newValue }
+            defaults.set(newValue, forKey: Key.turnModelsBySession)
+        }
+    }
+
+    func turnModel(at index: Int, for sessionID: String) -> String? {
+        guard index >= 0, let models = turnModelsBySession[sessionID], index < models.count else { return nil }
+        let model = models[index].trimmingCharacters(in: .whitespacesAndNewlines)
+        return model.isEmpty ? nil : model
+    }
+
+    func setTurnModel(_ model: String, at index: Int, for sessionID: String) {
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, index >= 0 else { return }
+        var map = turnModelsBySession
+        var models = map[sessionID] ?? []
+        if index >= models.count {
+            models.append(contentsOf: repeatElement("", count: index - models.count + 1))
+        }
+        models[index] = trimmed
+        map[sessionID] = models
+        turnModelsBySession = map
     }
 
     // MARK: - Helpers
