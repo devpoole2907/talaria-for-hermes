@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// A pending attachment the user has picked but not yet sent.
 struct ComposerAttachment: Identifiable, Equatable {
@@ -14,6 +15,13 @@ struct ComposerAttachment: Identifiable, Equatable {
         case .photo: return "photo"
         case .file: return "doc"
         }
+    }
+
+    /// Decoded thumbnail for photo attachments (already downscaled on pick), used to
+    /// show a preview chip instead of a generic name.
+    var previewImage: UIImage? {
+        guard kind == .photo, let data else { return nil }
+        return UIImage(data: data)
     }
 }
 
@@ -39,6 +47,7 @@ struct ChatComposer: View {
 
             if !attachments.isEmpty {
                 attachmentChips
+                    .transition(.opacity)
             }
 
             HStack(alignment: .bottom, spacing: Spacing.s) {
@@ -51,6 +60,7 @@ struct ChatComposer: View {
         .padding(.bottom, Spacing.s)
         .frame(maxWidth: .infinity)
         .background(.clear)
+        .animation(.snappy, value: attachments)
     }
 
     private var attachmentChips: some View {
@@ -60,6 +70,7 @@ struct ChatComposer: View {
                     AttachmentChip(attachment: attachment) {
                         attachments.removeAll { $0.id == attachment.id }
                     }
+                    .transition(.scale.combined(with: .opacity))
                 }
             }
             .padding(.horizontal, Spacing.xs)
@@ -213,6 +224,32 @@ private struct AttachmentChip: View {
     var onRemove: () -> Void
 
     var body: some View {
+        if let image = attachment.previewImage {
+            photoChip(image)
+        } else {
+            fileChip
+        }
+    }
+
+    private func photoChip(_ image: UIImage) -> some View {
+        Image(uiImage: image)
+            .resizable()
+            .scaledToFill()
+            .frame(width: 48, height: 48)
+            .clipShape(.rect(cornerRadius: Radii.medium))
+            .overlay(alignment: .topTrailing) {
+                Button(action: onRemove) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.body)
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(.white, .black.opacity(0.55))
+                }
+                .padding(2)
+                .accessibilityLabel("Remove photo")
+            }
+    }
+
+    private var fileChip: some View {
         HStack(spacing: Spacing.xs) {
             Image(systemName: attachment.systemImage)
                 .font(.caption)
