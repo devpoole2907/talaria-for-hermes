@@ -209,15 +209,92 @@ final class HermesClient {
         _ = try await performAdminRawRequest(request)
     }
 
+    // MARK: - Runs API
+
+    /// Creates a new run. Passes `conversationHistory` (role+content pairs) as
+    /// context since the Runs handler does NOT auto-load session history. The
+    /// history is context-only and is not re-persisted to the session.
+    func createRun(
+        sessionID: String,
+        input: String,
+        model: String?,
+        conversationHistory: [[String: String]]
+    ) async throws -> String {
+        struct Body: Encodable {
+            let input: String
+            let sessionId: String
+            let model: String?
+            let conversationHistory: [[String: String]]
+        }
+        let handle: RunHandle = try await send(
+            .post,
+            "/v1/runs",
+            body: Body(
+                input: input,
+                sessionId: sessionID,
+                model: model,
+                conversationHistory: conversationHistory
+            )
+        )
+        return handle.runId
+    }
+
+    /// Creates a new run with multipart (text + images) input.
+    /// The Runs API likely accepts the same array-form `input` as session chat;
+    /// this overload forwards the HermesChatInput directly.
+    /// TODO: verify image_url part support against the live Runs handler.
+    func createRunMultimodal(
+        sessionID: String,
+        input: HermesChatInput,
+        model: String?,
+        conversationHistory: [[String: String]]
+    ) async throws -> String {
+        struct Body: Encodable {
+            let input: HermesChatInput
+            let sessionId: String
+            let model: String?
+            let conversationHistory: [[String: String]]
+        }
+        let handle: RunHandle = try await send(
+            .post,
+            "/v1/runs",
+            body: Body(
+                input: input,
+                sessionId: sessionID,
+                model: model,
+                conversationHistory: conversationHistory
+            )
+        )
+        return handle.runId
+    }
+
+    /// Returns a live SSE stream of events for a Runs API run.
+    /// Each emitted event's name is in the JSON data field ("event": "<name>").
+    func runEvents(runID: String) -> AsyncThrowingStream<HermesStreamEvent, Error> {
+        RunEventStream.events(baseURL: baseURL, apiKey: apiKey, runID: runID)
+    }
+
+    /// Polls the current status of a run (started/running/waiting_for_approval/completed/…).
+    func runStatus(runID: String) async throws -> RunHandle {
+        try await get("/v1/runs/\(runID)")
+    }
+
     // MARK: - Runs control
 
     func stopRun(runID: String) async throws {
         _ = try await performRequest(method: .post, path: "/v1/runs/\(runID)/stop", body: Optional<EmptyBody>.none)
     }
 
+    /// Posts an approval choice for a paused run. Choice values:
+    /// "once" | "session" | "always" | "deny".
+    func approveRun(runID: String, choice: String) async throws {
+        struct Body: Encodable { let choice: String }
+        _ = try await performRequest(method: .post, path: "/v1/runs/\(runID)/approval", body: Body(choice: choice))
+    }
+
+    /// Legacy session-stream approval signature kept for backward compat; maps to the new choice-based body.
     func approveRun(runID: String, approvalID: String, decision: String) async throws {
-        struct Body: Encodable { let approvalId: String; let decision: String }
-        _ = try await performRequest(method: .post, path: "/v1/runs/\(runID)/approval", body: Body(approvalId: approvalID, decision: decision))
+        try await approveRun(runID: runID, choice: decision)
     }
 
     // MARK: - Streaming (nonisolated factories)

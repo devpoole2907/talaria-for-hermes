@@ -89,6 +89,21 @@ final class ChatStore {
     var lastUsage: TokenUsage?
     private(set) var streamingRevision = 0
 
+    // MARK: - Runs API approval state
+    //
+    // When the Runs API emits `approval.request`, the run pauses server-side.
+    // We surface an actionable card so the user can choose. Once they choose,
+    // we POST the choice and wait for the run to complete (it re-emits events
+    // on a new /events connection since the old SSE stream ended at the pause).
+    private(set) var pendingApproval: ApprovalRequest?
+
+    // MARK: - Runtime flag
+
+    /// When true, new turns use the Runs API (/v1/runs) instead of the session
+    /// chat stream. Defaults ON. Toggle via UserDefaults -UseRunsAPI 0 or the
+    /// feature flag in AppModel. Falls back to session-stream when OFF.
+    var useRunsAPI: Bool = UserDefaults.standard.object(forKey: "UseRunsAPI") as? Bool ?? true
+
     // Ephemeral streaming state
     private var streamingText: [String: String] = [:]
     private var streamingThinking: [String: String] = [:]
@@ -204,7 +219,12 @@ final class ChatStore {
             // keep it unless the server has a complete reply for that turn.
             timeline = mergeServer(serverTimeline, withLocal: timeline)
             rebuildTurns()
-            adoptExternalRunIfNeeded(from: messages)
+            if useRunsAPI {
+                // On the Runs path, recover via persisted run_id if one exists.
+                recoverRunsAPIRunIfNeeded()
+            } else {
+                adoptExternalRunIfNeeded(from: messages)
+            }
             // Persist the merged truth so the next cold launch is instant.
             repository?.upsertMessages(timeline, sessionID: sessionID, profileID: profileID)
         } catch {
@@ -245,6 +265,7 @@ final class ChatStore {
         lastError = nil
         currentRunID = nil
         currentPartialLocalID = nil
+        pendingApproval = nil
         streamingText.removeAll()
         streamingThinking.removeAll()
         liveTools.removeAll()
@@ -296,7 +317,11 @@ final class ChatStore {
         streamTask?.cancel()
         streamTask = Task { [weak self] in
             guard let self else { return }
-            await self.runStream(input: input, uploadIDs: uploadIDs)
+            if self.useRunsAPI {
+                await self.runStreamViaRunsAPI(agentText: agentText, input: input, uploadIDs: uploadIDs)
+            } else {
+                await self.runStream(input: input, uploadIDs: uploadIDs)
+            }
         }
     }
 
@@ -420,6 +445,380 @@ final class ChatStore {
         }
     }
 
+    // MARK: - Runs API streaming path
+
+    /// Sends a turn via the Runs API: fetches history, creates a run, persists the
+    /// run_id, streams events, handles approvals, and finalizes from /messages.
+    private func runStreamViaRunsAPI(agentText: String, input: HermesChatInput, uploadIDs: [String] = []) async {
+        defer {
+            if !uploadIDs.isEmpty {
+                Task { [client] in
+                    for id in uploadIDs { try? await client.deleteAttachment(id: id) }
+                }
+            }
+        }
+
+        // Acquire model gate and prepare the session model (same as session-stream path).
+        await modelGate?.acquire()
+        var gateReleased = false
+        func releaseGate() {
+            guard !gateReleased else { return }
+            gateReleased = true
+            modelGate?.release()
+        }
+
+        currentTurnModelID = await onTurnStart?() ?? nil
+        if let model = currentTurnModelID {
+            turnModelByIndex[lastTurnIndex] = model
+            persistTurnModel?(lastTurnIndex, model)
+        }
+        guard !Task.isCancelled else { releaseGate(); working = false; awaitingResult = false; return }
+
+        // Fetch conversation history before creating the run — the Runs handler
+        // does NOT auto-load session history, so we must supply it.
+        let conversationHistory: [[String: String]]
+        do {
+            let serverMessages = try await client.messages(sessionID: sessionID)
+            // Build role+content pairs, filtering only user and assistant messages
+            // (tool-call messages aren't meaningful context for the Runs handler).
+            conversationHistory = serverMessages.compactMap { msg -> [String: String]? in
+                guard msg.role == "user" || msg.role == "assistant",
+                      let content = msg.content, !content.isEmpty
+                else { return nil }
+                return ["role": msg.role, "content": content]
+            }
+        } catch {
+            releaseGate()
+            lastError = HermesError(error)
+            working = false
+            awaitingResult = false
+            rebuildTurns()
+            return
+        }
+        guard !Task.isCancelled else { releaseGate(); working = false; awaitingResult = false; return }
+
+        // Create the run. For text-only turns use the simple string input; for
+        // multimodal turns use the array form (image_url parts).
+        // TODO: verify image_url support on /v1/runs against the live server.
+        let runID: String
+        do {
+            switch input {
+            case .text(let txt):
+                runID = try await client.createRun(
+                    sessionID: sessionID,
+                    input: txt,
+                    model: currentTurnModelID,
+                    conversationHistory: conversationHistory
+                )
+            case .parts:
+                runID = try await client.createRunMultimodal(
+                    sessionID: sessionID,
+                    input: input,
+                    model: currentTurnModelID,
+                    conversationHistory: conversationHistory
+                )
+            }
+        } catch {
+            releaseGate()
+            let mapped = HermesError(error)
+            if let inline = mapped.inlineChatMessage {
+                commitErrorResponse(inline)
+                working = false
+                awaitingResult = false
+                rebuildTurns()
+            } else {
+                lastError = mapped
+                working = false
+                awaitingResult = false
+                rebuildTurns()
+            }
+            return
+        }
+        guard !Task.isCancelled else { releaseGate(); working = false; awaitingResult = false; return }
+
+        // Persist the run_id so recovery survives a relaunch.
+        currentRunID = runID
+        persistActiveRunID(runID)
+        rebuildTurns()
+
+        // Release the kickoff gate — model is now bound to this run.
+        releaseGate()
+
+        // Stream events and handle approvals in a loop. After an approval is
+        // posted, the server drops the /events connection; we reconnect once to
+        // catch the tail. (No server-side event replay — reconnect gets the tail.)
+        await streamRunEvents(runID: runID, reconnectAfterApproval: true)
+    }
+
+    /// Streams events from /v1/runs/{runID}/events, processes them, and on
+    /// completion (or drop) finalizes via /messages. If the run pauses for
+    /// approval and `reconnectAfterApproval` is true, waits for the approval to
+    /// be answered then reconnects to the same run's events.
+    private func streamRunEvents(runID: String, reconnectAfterApproval: Bool) async {
+        let stream = client.runEvents(runID: runID)
+        var hitApproval = false
+        var hitCompleted = false
+
+        do {
+            for try await event in stream {
+                if Task.isCancelled { return }
+                await processRunsEvent(event, runID: runID)
+                if case .runsApprovalRequired = event {
+                    hitApproval = true
+                    // The server pauses; the stream ends here (no more events until approved).
+                    break
+                }
+                if case .runCompleted = event {
+                    hitCompleted = true
+                    break
+                }
+                if case .runFailed = event {
+                    hitCompleted = true
+                    break
+                }
+            }
+        } catch {
+            guard !Task.isCancelled else { return }
+            let mapped = HermesError(error)
+            // "Not found" after approval is expected — the stream ended at the pause.
+            // Fall through to the reconnect logic.
+            if mapped != .notFound && mapped != .cancelled {
+                // Surface inline if it's a model/run error with body; else silent drop.
+                if let inline = mapped.inlineChatMessage {
+                    commitErrorResponse(inline)
+                    working = false
+                    awaitingResult = false
+                    rebuildTurns()
+                    clearActiveRunID()
+                    return
+                }
+                // Otherwise treat as a dropped connection — recover via messages endpoint.
+            }
+        }
+
+        if hitCompleted {
+            // run.completed received — fetch authoritative messages.
+            await finalizeRunFromMessages()
+            return
+        }
+
+        if hitApproval && reconnectAfterApproval {
+            // Wait for the approval card to be dismissed (user picked a choice).
+            // pendingApproval is cleared by approveRun(choice:) which also resumes the run.
+            // After approval is posted, reconnect once to get the tail events.
+            await waitForApprovalAndReconnect(runID: runID)
+            return
+        }
+
+        // Stream ended without runCompleted (dropped connection) — recover via messages.
+        await recoverInterruptedRunsRun(runID: runID)
+    }
+
+    /// Waits until the pending approval is cleared (user answered), then reconnects
+    /// to /events for the tail, and finalizes.
+    private func waitForApprovalAndReconnect(runID: String) async {
+        // Poll in a tight loop for approval dismissal (pendingApproval == nil).
+        // The UI calls approveRun(choice:) which clears pendingApproval and posts
+        // the choice; we then reconnect.
+        while pendingApproval != nil {
+            guard !Task.isCancelled else { return }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        guard !Task.isCancelled else { return }
+
+        // Small delay to allow the server to process the approval before we reconnect.
+        try? await Task.sleep(for: .milliseconds(300))
+
+        // Reconnect for the tail. reconnectAfterApproval=false so we don't loop infinitely.
+        await streamRunEvents(runID: runID, reconnectAfterApproval: false)
+    }
+
+    /// Processes a single Runs API event. Mirrors `process()` for the session-stream path.
+    private func processRunsEvent(_ event: HermesStreamEvent, runID: String) async {
+        switch event {
+        case .assistantDelta(let msgID, let text):
+            await revealAssistantText(messageID: msgID, text: text)
+
+        case .thinkingDelta(let msgID, let text):
+            await revealThinkingText(messageID: msgID, text: text)
+
+        case .runCompleted(_, let usage):
+            // Don't finalize yet — caller drives finalization after stream ends.
+            lastUsage = usage
+            needsCompletionRefresh = true
+            receivedRunCompleted = true
+
+        case .runsApprovalRequired(let req):
+            // Surface the approval card; run is now paused server-side.
+            pendingApproval = req
+            rebuildTurns()
+
+        case .runFailed(let error):
+            commitErrorResponse(error)
+            working = false
+            reconnecting = false
+            awaitingResult = false
+            streamingText.removeAll()
+            streamingThinking.removeAll()
+            liveTools.removeAll()
+            liveBlocks.removeAll()
+            currentStreamMsgID = nil
+            clearActiveRunID()
+            rebuildTurns()
+
+        default:
+            // Delegate tool events, runStarted, etc. to the shared apply() path.
+            apply(event)
+            if event.isDiscreteStreamingEvent {
+                await yieldStreamingFrame()
+            }
+        }
+    }
+
+    /// Posts an approval choice for the current pending approval.
+    /// Called from the approval UI; clears pendingApproval so the wait loop resumes.
+    func approveRun(choice: String) {
+        guard let approval = pendingApproval else { return }
+        let runID = approval.runID
+        pendingApproval = nil
+        Task {
+            try? await client.approveRun(runID: runID, choice: choice)
+        }
+    }
+
+    /// Finalizes the current Runs path turn by fetching the authoritative message list.
+    private func finalizeRunFromMessages() async {
+        if let messages = try? await client.messages(sessionID: sessionID),
+           hasCompletedAssistantReply(in: messages) {
+            await finalizeFromMessages(messages)
+        } else {
+            // Not complete yet — fall back to polling recovery.
+            await recoverInterruptedRunsRun(runID: currentRunID ?? "")
+        }
+        clearActiveRunID()
+    }
+
+    /// Recovery for a dropped Runs API stream: polls run status, then /messages.
+    private func recoverInterruptedRunsRun(runID: String) async {
+        guard awaitingResult, !recovering else { return }
+        recovering = true
+        reconnecting = true
+        working = true
+        rebuildTurns()
+        defer {
+            recovering = false
+            reconnecting = false
+        }
+
+        let deadline = Date.now.addingTimeInterval(Self.recoveryWindow)
+        var delay: Duration = .seconds(2)
+        while Date.now < deadline {
+            if Task.isCancelled { return }
+
+            // Check run status first.
+            if let status = try? await client.runStatus(runID: runID) {
+                switch status.status ?? "" {
+                case "waiting_for_approval":
+                    // Run is paused — we lost the approval event. Fetch the status
+                    // to reconstruct it. For now, just wait and retry so the user
+                    // doesn't get stuck forever.
+                    break
+                case "completed":
+                    if let messages = try? await client.messages(sessionID: sessionID),
+                       hasCompletedAssistantReply(in: messages) {
+                        await finalizeFromMessages(messages)
+                        clearActiveRunID()
+                        return
+                    }
+                case "failed":
+                    working = false
+                    awaitingResult = false
+                    reconnecting = false
+                    clearActiveRunID()
+                    rebuildTurns()
+                    return
+                default:
+                    // still running — also check messages in case
+                    break
+                }
+            }
+
+            if let messages = try? await client.messages(sessionID: sessionID),
+               hasCompletedAssistantReply(in: messages) {
+                await finalizeFromMessages(messages)
+                clearActiveRunID()
+                return
+            }
+            try? await Task.sleep(for: delay)
+            delay = min(delay * 2, .seconds(8))
+        }
+
+        guard !receivedRunCompleted else { return }
+        working = false
+        clearActiveRunID()
+        rebuildTurns()
+    }
+
+    // MARK: - Run ID persistence
+
+    private func persistActiveRunID(_ runID: String) {
+        repository?.setActiveRunID(runID, sessionID: sessionID, profileID: profileID)
+    }
+
+    private func clearActiveRunID() {
+        repository?.setActiveRunID(nil, sessionID: sessionID, profileID: profileID)
+    }
+
+    // MARK: - Runs API recovery on chat open
+
+    /// Called on chat open (after `load()`): if there's a persisted run_id that's
+    /// still running or waiting for approval, reconnect to its events stream.
+    func recoverRunsAPIRunIfNeeded() {
+        guard useRunsAPI, !working, !awaitingResult else { return }
+        guard let persistedRunID = repository?.activeRunID(sessionID: sessionID, profileID: profileID),
+              !persistedRunID.isEmpty
+        else { return }
+
+        awaitingResult = true
+        recovering = false
+        recoveryTask?.cancel()
+        recoveryTask = Task { [weak self] in
+            guard let self else { return }
+            await self.reconnectToPersistedRun(runID: persistedRunID)
+            self.recoveryTask = nil
+        }
+    }
+
+    private func reconnectToPersistedRun(runID: String) async {
+        guard let status = try? await client.runStatus(runID: runID) else {
+            // Can't reach server — fall back to messages polling.
+            await recoverInterruptedRunsRun(runID: runID)
+            return
+        }
+
+        switch status.status ?? "" {
+        case "waiting_for_approval", "running", "started":
+            // Run is live — reconnect to events for the tail.
+            currentRunID = runID
+            working = true
+            reconnecting = true
+            rebuildTurns()
+            await streamRunEvents(runID: runID, reconnectAfterApproval: true)
+            reconnecting = false
+        case "completed":
+            // Already done; just load from messages.
+            if let messages = try? await client.messages(sessionID: sessionID),
+               hasCompletedAssistantReply(in: messages) {
+                await finalizeFromMessages(messages)
+            }
+            clearActiveRunID()
+        default:
+            // Unknown/failed status — clear the stale run_id.
+            clearActiveRunID()
+            awaitingResult = false
+        }
+    }
+
     private func process(_ event: HermesStreamEvent) async {
         switch event {
         case .assistantDelta(let msgID, let text):
@@ -453,10 +852,12 @@ final class ChatStore {
         // or the partial reply (which lives only in ephemeral streaming state until
         // a completion event) disappears instead of freezing in place.
         commitPartialResponseOnStop()
+        pendingApproval = nil
         working = false
         reconnecting = false
         recovering = false
         awaitingResult = false
+        clearActiveRunID()
         rebuildTurns()
         if let runID = currentRunID {
             Task {
@@ -542,7 +943,7 @@ final class ChatStore {
                 shouldMarkStreamingLayoutChanged = true
             }
 
-        case .approvalRequired, .unknown:
+        case .approvalRequired, .runsApprovalRequired, .unknown:
             break
 
         case .runCompleted(let messages, let usage):
@@ -1129,8 +1530,13 @@ final class ChatStore {
         guard awaitingResult, !recovering else { return }
         recoveryTask?.cancel()
         recoveryTask = Task { [weak self] in
-            await self?.recoverInterruptedRun()
-            self?.recoveryTask = nil
+            guard let self else { return }
+            if self.useRunsAPI, let runID = self.currentRunID {
+                await self.recoverInterruptedRunsRun(runID: runID)
+            } else {
+                await self.recoverInterruptedRun()
+            }
+            self.recoveryTask = nil
         }
     }
 
@@ -1269,7 +1675,7 @@ private extension HermesStreamEvent {
         switch self {
         case .toolStarted, .toolCompleted:
             return true
-        case .runStarted, .messageStarted, .assistantDelta, .assistantCompleted, .thinkingDelta, .toolProgress, .approvalRequired, .runCompleted, .runFailed, .unknown:
+        case .runStarted, .messageStarted, .assistantDelta, .assistantCompleted, .thinkingDelta, .toolProgress, .approvalRequired, .runsApprovalRequired, .runCompleted, .runFailed, .unknown:
             return false
         }
     }

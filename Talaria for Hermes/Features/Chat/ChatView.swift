@@ -27,17 +27,28 @@ struct ChatView: View {
             if let store {
                 MessageTimelineWebView(store: store)
                     .safeAreaInset(edge: .bottom, spacing: 0) {
-                        ChatComposer(
-                            text: $draftText,
-                            attachments: $attachments,
-                            isWorking: store.working,
-                            onSend: { text in
-                                Task { await self.send(text, store: store) }
-                            },
-                            onStop: { store.stop() },
-                            onAttachPhoto: { showPhotoPicker = true },
-                            onAttachFile: { showFilePicker = true }
-                        )
+                        VStack(spacing: 0) {
+                            // Actionable approval card (Runs API path only).
+                            // Shown above the composer when the agent is waiting for consent.
+                            if let approval = store.pendingApproval {
+                                ApprovalCardView(approval: approval) { choice in
+                                    store.approveRun(choice: choice)
+                                }
+                                .transition(.move(edge: .bottom).combined(with: .opacity))
+                            }
+                            ChatComposer(
+                                text: $draftText,
+                                attachments: $attachments,
+                                isWorking: store.working,
+                                onSend: { text in
+                                    Task { await self.send(text, store: store) }
+                                },
+                                onStop: { store.stop() },
+                                onAttachPhoto: { showPhotoPicker = true },
+                                onAttachFile: { showFilePicker = true }
+                            )
+                        }
+                        .animation(.easeInOut(duration: 0.25), value: store.pendingApproval != nil)
                     }
             } else {
                 ProgressView()
@@ -90,7 +101,13 @@ struct ChatView: View {
         .onChange(of: scenePhase) { _, phase in
             // Returning to the foreground: resume any run whose stream was dropped
             // while the app was suspended, instead of leaving it stuck.
-            if phase == .active { store?.recoverIfNeeded() }
+            if phase == .active {
+                if store?.useRunsAPI == true {
+                    store?.recoverRunsAPIRunIfNeeded()
+                } else {
+                    store?.recoverIfNeeded()
+                }
+            }
         }
         .onChange(of: draftText) { _, newValue in
             appModel.preferences.setDraftText(newValue, for: session.id)
@@ -258,7 +275,12 @@ struct ChatView: View {
             await chatStore.load()
             errorMessage = chatStore.lastError?.errorDescription
         }
-        chatStore.recoverIfNeeded()
+        // Recovery: load() already calls recoverRunsAPIRunIfNeeded() or
+        // adoptExternalRunIfNeeded() based on the flag. Call recoverIfNeeded()
+        // to also handle foreground re-entry on the session-stream path.
+        if !chatStore.useRunsAPI {
+            chatStore.recoverIfNeeded()
+        }
     }
 
     private func send(_ text: String, store: ChatStore) async {

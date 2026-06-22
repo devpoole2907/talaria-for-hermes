@@ -18,6 +18,11 @@ import SwiftData
     /// Local write timestamp; used to resolve CloudKit merge conflicts (last-write-wins).
     var updatedAt: Double = 0
 
+    /// Active Runs API run_id for this session, persisted so recovery survives relaunch.
+    /// nil when no run is in-flight or the session uses the session-stream path.
+    /// CloudKit rule: defaulted optional, no unique constraint.
+    var activeRunID: String? = nil
+
     @Relationship(deleteRule: .cascade, inverse: \StoredMessage.session)
     var messages: [StoredMessage]? = []
 

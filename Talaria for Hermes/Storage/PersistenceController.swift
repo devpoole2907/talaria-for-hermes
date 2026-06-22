@@ -179,6 +179,35 @@ final class ChatRepository {
         try? context.save()
     }
 
+    // MARK: - Active run ID
+
+    /// Returns the persisted active run_id for a session, used by the Runs API
+    /// path to reconnect on relaunch if the stream was dropped mid-run.
+    func activeRunID(sessionID: String, profileID: String) -> String? {
+        storedSession(id: sessionID, profileID: profileID)?.activeRunID
+    }
+
+    /// Persists (or clears) the active run_id for a session.
+    func setActiveRunID(_ runID: String?, sessionID: String, profileID: String) {
+        if let stored = storedSession(id: sessionID, profileID: profileID) {
+            stored.activeRunID = runID
+        } else {
+            // Session not yet in local store; create a placeholder.
+            let stored = StoredSession(id: sessionID, profileID: profileID)
+            stored.activeRunID = runID
+            context.insert(stored)
+        }
+        try? context.save()
+    }
+
+    private func storedSession(id: String, profileID: String) -> StoredSession? {
+        let predicate = #Predicate<StoredSession> {
+            $0.id == id && $0.profileID == profileID
+        }
+        let descriptor = FetchDescriptor<StoredSession>(predicate: predicate)
+        return try? context.fetch(descriptor).first
+    }
+
     /// Removes a session and its messages (cascade) from the local store.
     func deleteSession(id: String, profileID: String) {
         let predicate = #Predicate<StoredSession> {
