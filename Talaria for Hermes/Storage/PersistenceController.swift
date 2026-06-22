@@ -4,33 +4,51 @@ import SwiftData
 // MARK: - PersistenceController
 
 /// Builds and owns the SwiftData ModelContainer.
-/// CloudKit sync is enabled automatically when the app's entitlements carry the
-/// iCloud container identifier; falls back to local-only in sim / CI builds where
-/// the container isn't provisioned. The `ModelConfiguration.cloudKitDatabase: .automatic`
-/// flag handles that distinction at runtime — no code change required.
+/// CloudKit sync is opt-in from Settings. When enabled, SwiftData still falls
+/// back gracefully in simulator / CI builds where the iCloud container isn't
+/// provisioned.
 final class PersistenceController {
-    static let shared = PersistenceController()
-
     let container: ModelContainer
 
-    private init() {
+    init(iCloudSyncEnabled: Bool) throws {
         let schema = Schema([StoredSession.self, StoredMessage.self])
+        let cloudKitDatabase: ModelConfiguration.CloudKitDatabase = iCloudSyncEnabled ? .automatic : .none
+        container = try Self.makeContainer(schema: schema, cloudKitDatabase: cloudKitDatabase)
+    }
+
+    private static func makeContainer(
+        schema: Schema,
+        cloudKitDatabase: ModelConfiguration.CloudKitDatabase
+    ) throws -> ModelContainer {
         let config = ModelConfiguration(
             schema: schema,
             isStoredInMemoryOnly: false,
-            cloudKitDatabase: .automatic
+            cloudKitDatabase: cloudKitDatabase
         )
         do {
-            container = try ModelContainer(for: schema, configurations: [config])
+            try prepareStoreDirectory(for: config)
+            return try ModelContainer(for: schema, configurations: [config])
         } catch {
             // Non-recoverable: if the store is corrupt, wipe and start fresh rather
-            // than crash-loop. Data will resync from server on next launch.
-            let url = config.url
-            try? FileManager.default.removeItem(at: url)
-            container = try! ModelContainer(for: schema, configurations: [
-                ModelConfiguration(schema: schema, isStoredInMemoryOnly: false, cloudKitDatabase: .automatic)
-            ])
+            // than crash-loop. Data can be repopulated from Hermes and, when enabled,
+            // CloudKit.
+            destroyStore(at: config.url)
+            try prepareStoreDirectory(for: config)
+            return try ModelContainer(for: schema, configurations: [config])
         }
+    }
+
+    private static func prepareStoreDirectory(for config: ModelConfiguration) throws {
+        try FileManager.default.createDirectory(
+            at: config.url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+    }
+
+    private static func destroyStore(at url: URL) {
+        try? FileManager.default.removeItem(at: url)
+        try? FileManager.default.removeItem(at: URL(fileURLWithPath: url.path + "-shm"))
+        try? FileManager.default.removeItem(at: URL(fileURLWithPath: url.path + "-wal"))
     }
 }
 
@@ -41,12 +59,14 @@ final class PersistenceController {
 /// state mutations on the same actor with no concurrency overhead.
 @MainActor
 final class ChatRepository {
+    private let container: ModelContainer
     private let context: ModelContext
 
     private static let toolCallEncoder = JSONEncoder()
     private static let toolCallDecoder = JSONDecoder()
 
     init(container: ModelContainer) {
+        self.container = container
         self.context = container.mainContext
     }
 

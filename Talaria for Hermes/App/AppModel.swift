@@ -17,8 +17,7 @@ final class AppModel {
     /// turns (multi-agent workflows) can't run on each other's model. See ModelGate.
     let modelGate = ModelGate()
 
-    /// Local-first persistence + CloudKit sync repository. Nil when the container
-    /// fails to initialize (corrupt store is wiped automatically and retried once).
+    /// Local-first persistence repository with optional CloudKit sync.
     private(set) var repository: ChatRepository?
 
     var serverHealth: HealthInfo?

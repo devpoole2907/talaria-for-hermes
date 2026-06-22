@@ -29,18 +29,16 @@ struct SessionListView: View {
                 } else {
                     EmptySessionListView(onCreate: createSession)
                 }
+            } else if hasNoSearchResults {
+                ContentUnavailableView.search
             } else {
                 sessionList
-            }
-        }
-        .safeAreaInset(edge: .bottom) {
-            if !appModel.sessionStore.sessions.isEmpty {
-                sessionSearchBar
             }
         }
         .toolbar { toolbarContent }
         .navigationTitle("Sessions")
         .navigationBarTitleDisplayMode(.inline)
+        .searchable(text: $searchText, prompt: "Search sessions")
         .refreshable(action: refresh)
         .sheet(isPresented: $showSettings) { SettingsView() }
         .alert("Couldn't create session", isPresented: errorBinding) {
@@ -60,37 +58,19 @@ struct SessionListView: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItem(placement: .topBarTrailing) {
-            HStack {
-                Button("Settings", systemImage: "gearshape", action: { showSettings = true })
-                Button("New Session", systemImage: "plus", action: createSession)
-            }
+            Button("Settings", systemImage: "gearshape", action: { showSettings = true })
         }
-    }
 
-    private var sessionSearchBar: some View {
-        HStack(spacing: Spacing.s) {
-            Image(systemName: "magnifyingglass")
-                .foregroundStyle(.secondary)
-            TextField("Search sessions", text: $searchText)
-                .textFieldStyle(.plain)
-                .autocorrectionDisabled()
-                .submitLabel(.search)
-            if !searchText.isEmpty {
-                Button {
-                    searchText = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Clear search")
-            }
+        #if os(iOS) && !targetEnvironment(macCatalyst)
+        ToolbarItemGroup(placement: .bottomBar) {
+            Spacer()
+            Button("New Session", systemImage: "plus", action: createSession)
         }
-        .padding(.horizontal, Spacing.m)
-        .padding(.vertical, Spacing.s)
-        .background(.regularMaterial, in: .rect(cornerRadius: Radii.large))
-        .padding(.horizontal, Spacing.m)
-        .padding(.bottom, Spacing.s)
+        #else
+        ToolbarItem(placement: .topBarTrailing) {
+            Button("New Session", systemImage: "plus", action: createSession)
+        }
+        #endif
     }
 
     private var loadingPlaceholder: some View {
@@ -139,15 +119,36 @@ struct SessionListView: View {
             NavigationLink(value: session) {
                 SessionRowView(session: session)
             }
+            .contextMenu {
+                Button("Rename", systemImage: "pencil") {
+                    beginRename(session)
+                }
+
+                Button(isPinned(session) ? "Unpin" : "Pin", systemImage: isPinned(session) ? "pin.slash" : "pin") {
+                    togglePinned(session)
+                }
+
+                Divider()
+
+                Button("Delete", systemImage: "trash", role: .destructive) {
+                    requestDelete(session)
+                }
+            } preview: {
+                SessionContextPreview(session: session, isPinned: isPinned(session))
+            }
             .swipeActions(edge: .trailing) {
                 Button("Delete", systemImage: "trash", role: .destructive) {
-                    sessionToDelete = session
+                    requestDelete(session)
                 }
             }
             .swipeActions(edge: .leading) {
+                Button(isPinned(session) ? "Unpin" : "Pin", systemImage: isPinned(session) ? "pin.slash" : "pin") {
+                    togglePinned(session)
+                }
+                .tint(.accentColor)
+
                 Button("Rename", systemImage: "pencil") {
-                    renameText = session.title ?? ""
-                    sessionToRename = session
+                    beginRename(session)
                 }
                 .tint(.orange)
             }
@@ -164,7 +165,15 @@ struct SessionListView: View {
         return filtered(appModel.sessionStore.sessions.filter { !pinned.contains($0.id) })
     }
 
-    /// Filters by the bottom search field, matching the session's display title.
+    private var hasNoSearchResults: Bool {
+        hasSearchQuery && pinnedSessions.isEmpty && unpinnedSessions.isEmpty
+    }
+
+    private var hasSearchQuery: Bool {
+        !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Filters by the native search field, matching the session's display title.
     private func filtered(_ sessions: [Session]) -> [Session] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return sessions }
@@ -190,6 +199,24 @@ struct SessionListView: View {
 
     private func retry() {
         Task { await appModel.start() }
+    }
+
+    private func beginRename(_ session: Session) {
+        renameText = session.title ?? ""
+        sessionToRename = session
+    }
+
+    private func isPinned(_ session: Session) -> Bool {
+        appModel.preferences.isSessionPinned(session.id, for: appModel.activeProfile.id)
+    }
+
+    private func togglePinned(_ session: Session) {
+        appModel.preferences.setSessionPinned(!isPinned(session), sessionID: session.id, for: appModel.activeProfile.id)
+        appModel.haptics.selection()
+    }
+
+    private func requestDelete(_ session: Session) {
+        sessionToDelete = session
     }
 
     private func createSession() {

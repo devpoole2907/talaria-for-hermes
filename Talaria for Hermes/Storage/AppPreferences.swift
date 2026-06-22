@@ -9,6 +9,7 @@ final class AppPreferences {
     private enum Key {
         static let activeProfileID = "activeProfileID"
         static let hermesSessionKey = "hermesSessionKey"
+        static let iCloudSyncEnabled = "iCloudSyncEnabled"
         static let defaultModelByProfile = "defaultModelByProfile"
         static let defaultModelProviderByProfile = "defaultModelProviderByProfile"
         static let recentModelsByProfile = "recentModelsByProfile"
@@ -22,6 +23,7 @@ final class AppPreferences {
         self.defaults = defaults
         self._activeProfileID = Self.readUUID(defaults, key: Key.activeProfileID)
         self._hermesSessionKey = Self.resolveSessionKey(defaults)
+        self._iCloudSyncEnabled = defaults.object(forKey: Key.iCloudSyncEnabled) as? Bool ?? false
         self._defaultModelByProfile = Self.readModelMap(defaults, key: Key.defaultModelByProfile)
         self._defaultModelProviderByProfile = Self.readModelMap(defaults, key: Key.defaultModelProviderByProfile)
         self._recentModelsByProfile = Self.readRecentModelMap(defaults, key: Key.recentModelsByProfile)
@@ -47,6 +49,17 @@ final class AppPreferences {
     private var _hermesSessionKey: String
     var hermesSessionKey: String {
         get { access(keyPath: \._hermesSessionKey); return _hermesSessionKey }
+    }
+
+    // MARK: - Sync
+
+    private var _iCloudSyncEnabled: Bool
+    var iCloudSyncEnabled: Bool {
+        get { access(keyPath: \._iCloudSyncEnabled); return _iCloudSyncEnabled }
+        set {
+            withMutation(keyPath: \._iCloudSyncEnabled) { _iCloudSyncEnabled = newValue }
+            defaults.set(newValue, forKey: Key.iCloudSyncEnabled)
+        }
     }
 
     // MARK: - Default model per profile

@@ -134,7 +134,7 @@ final class ChatStore {
     /// concurrent turns can't clobber each other's global model. See `ModelGate`.
     private let modelGate: ModelGate?
 
-    /// Optional SwiftData repository for local-first persistence and CloudKit sync.
+    /// Optional SwiftData repository for local-first persistence and optional CloudKit sync.
     /// nil in the DEBUG harness (no container there) and guards all write paths.
     private let repository: ChatRepository?
     /// The profile this session belongs to, used to scope SwiftData queries.

@@ -8,14 +8,16 @@ struct RootView: View {
     @State private var isInWelcomeFlow: Bool
     @State private var setupTarget: SetupTarget?
 
-    /// Shared persistence repository, injected from TalariaApp so the same
+    /// Shared persistence repository, built once from preferences so the same
     /// ModelContainer is used across the whole app lifecycle.
-    private let repository: ChatRepository
+    private let repository: ChatRepository?
 
-    init(repository: ChatRepository) {
-        self.repository = repository
+    init() {
         let preferences = AppPreferences()
         let profileStore = ServerProfileStore()
+        let persistenceController = try? PersistenceController(iCloudSyncEnabled: preferences.iCloudSyncEnabled)
+        let repository = persistenceController.map { ChatRepository(container: $0.container) }
+        self.repository = repository
         _preferences = State(initialValue: preferences)
         _profileStore = State(initialValue: profileStore)
 
