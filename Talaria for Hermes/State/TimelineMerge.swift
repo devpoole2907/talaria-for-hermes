@@ -42,10 +42,13 @@ func mergeServer(_ server: [TimelineMessage], withLocal local: [TimelineMessage]
             result.append(contentsOf: serverTurn.nonUserMessages)
         } else {
             // Server has the user message but no assistant reply yet. Keep the server
-            // user message (authoritative id/timestamp) and carry local partials.
+            // user message (authoritative id/timestamp) and carry the local partial.
             result.append(serverTurn.userMessage)
-            // Include local non-user messages only when there's no server reply.
-            result.append(contentsOf: localTurn!.nonUserMessages)
+            // Include local non-user messages, collapsing any run of incomplete
+            // assistant partials to just the last (longest) one — older builds wrote a
+            // fresh partial row every streaming tick, leaving N cumulative duplicates;
+            // this heals that on the next merge and is correct anyway (one partial reply).
+            result.append(contentsOf: collapsedPartials(localTurn!.nonUserMessages))
         }
     }
 
@@ -56,6 +59,33 @@ func mergeServer(_ server: [TimelineMessage], withLocal local: [TimelineMessage]
         result.append(contentsOf: turn.nonUserMessages)
     }
 
+    return result
+}
+
+/// Collapses a turn's local non-user messages so multiple incomplete assistant
+/// partials (from older per-tick persistence) become a single one — the last, which
+/// is the longest/most-recent snapshot. Tool messages and any completed assistant
+/// message are preserved as-is.
+private func collapsedPartials(_ messages: [TimelineMessage]) -> [TimelineMessage] {
+    let incompleteAssistants = messages.filter {
+        $0.message.role == "assistant" && $0.message.finishReason == nil
+    }
+    guard incompleteAssistants.count > 1 else { return messages }
+
+    var result: [TimelineMessage] = []
+    var keptPartial = false
+    for message in messages {
+        let isIncompleteAssistant = message.message.role == "assistant" && message.message.finishReason == nil
+        if isIncompleteAssistant {
+            // Keep only the last incomplete partial; drop the earlier cumulative ones.
+            if message.localID == incompleteAssistants.last?.localID, !keptPartial {
+                result.append(message)
+                keptPartial = true
+            }
+        } else {
+            result.append(message)
+        }
+    }
     return result
 }
 

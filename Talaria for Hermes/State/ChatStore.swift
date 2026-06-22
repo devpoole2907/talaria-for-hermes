@@ -153,6 +153,12 @@ final class ChatStore {
     /// Model resolved for the in-flight turn (set by `onTurnStart`).
     private var currentTurnModelID: String?
 
+    /// Stable local id for the current turn's streamed partial, so the throttled
+    /// `upsertPartial` writes UPDATE one row instead of inserting a new one each tick
+    /// (which would otherwise pile up N progressively-longer partials that reload as
+    /// duplicated, cumulative text). Reset on each send.
+    private var currentPartialLocalID: UUID?
+
     init(
         client: HermesClient,
         sessionID: String,
@@ -238,6 +244,7 @@ final class ChatStore {
         reconnecting = false
         lastError = nil
         currentRunID = nil
+        currentPartialLocalID = nil
         streamingText.removeAll()
         streamingThinking.removeAll()
         liveTools.removeAll()
@@ -764,8 +771,13 @@ final class ChatStore {
         let reasoning = activeStreamingThinking
         guard content?.isEmpty == false || reasoning?.isEmpty == false else { return }
 
+        // Reuse a stable local id across ticks so each write UPDATES one row rather
+        // than inserting a new progressively-longer partial every ~224ms.
+        let partialID = currentPartialLocalID ?? UUID()
+        currentPartialLocalID = partialID
+
         // Build a synthetic in-flight message mirroring streamingFallbackMessage().
-        let partial = TimelineMessage(message: HermesMessage(
+        let partial = TimelineMessage(storedLocalID: partialID, message: HermesMessage(
             id: nil,
             sessionId: sessionID,
             role: "assistant",
@@ -1181,12 +1193,13 @@ final class ChatStore {
             delay = min(delay * 2, .seconds(8))
         }
 
-        // Gave up actively polling. The turn stays recoverable (reopening or
-        // foregrounding the chat retries via `recoverIfNeeded()`); stop the spinner
-        // and leave a gentle, non-fatal note rather than a scary timeout error.
+        // Gave up actively polling. Don't pop a blocking alert telling the user to
+        // leave and come back — that's jarring UX. Just stop the spinner; the turn
+        // shows its inline "No response recorded" note, and recovery quietly retries
+        // when the chat reappears or the app foregrounds (recoverIfNeeded). It stays
+        // marked recoverable so a later poll can still spawn the reply inline.
         guard !receivedRunCompleted else { return }
         working = false
-        lastError = .network("Lost the connection while the agent was still responding. Reopen the chat to load the finished reply.")
         rebuildTurns()
     }
 
