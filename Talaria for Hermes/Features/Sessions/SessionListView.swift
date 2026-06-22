@@ -62,6 +62,10 @@ struct SessionListView: View {
         }
 
         #if os(iOS) && !targetEnvironment(macCatalyst)
+        if #available(iOS 26, *) {
+            DefaultToolbarItem(kind: .search, placement: .bottomBar)
+        }
+
         ToolbarItemGroup(placement: .bottomBar) {
             Spacer()
             Button("New Session", systemImage: "plus", action: createSession)
