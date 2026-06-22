@@ -275,10 +275,16 @@ struct ChatView: View {
             await chatStore.load()
             errorMessage = chatStore.lastError?.errorDescription
         }
-        // Recovery: load() already calls recoverRunsAPIRunIfNeeded() or
-        // adoptExternalRunIfNeeded() based on the flag. Call recoverIfNeeded()
-        // to also handle foreground re-entry on the session-stream path.
-        if !chatStore.useRunsAPI {
+        // Recovery must run on every open — not just when load() ran. On a cold
+        // relaunch the timeline is hydrated synchronously from local persistence
+        // (so it's non-empty and load() is skipped), and scenePhase doesn't fire
+        // .onChange for the initial launch. Without this call a run that was paused
+        // for approval (or streaming) when the app was killed is never reconnected
+        // and its approval card never reappears. The recovery guards are idempotent,
+        // so this is a no-op when load() already kicked it off.
+        if chatStore.useRunsAPI {
+            chatStore.recoverRunsAPIRunIfNeeded()
+        } else {
             chatStore.recoverIfNeeded()
         }
     }

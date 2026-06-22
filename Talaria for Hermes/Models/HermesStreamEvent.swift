@@ -2,7 +2,7 @@ import Foundation
 
 /// Rich payload for an approval.request event on the Runs API path.
 /// The run is paused (status: waiting_for_approval) until a choice is posted.
-struct ApprovalRequest: Sendable {
+struct ApprovalRequest: Sendable, Codable {
     let runID: String
     let command: String
     let description: String

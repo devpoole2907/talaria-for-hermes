@@ -200,6 +200,24 @@ final class ChatRepository {
         try? context.save()
     }
 
+    /// Returns the JSON-encoded approval the session's run is paused on, if any.
+    func pendingApprovalJSON(sessionID: String, profileID: String) -> String? {
+        storedSession(id: sessionID, profileID: profileID)?.pendingApprovalJSON
+    }
+
+    /// Persists (or clears) the approval payload the run is paused on, so the card
+    /// can be restored on relaunch (the server doesn't replay it).
+    func setPendingApprovalJSON(_ json: String?, sessionID: String, profileID: String) {
+        if let stored = storedSession(id: sessionID, profileID: profileID) {
+            stored.pendingApprovalJSON = json
+        } else {
+            let stored = StoredSession(id: sessionID, profileID: profileID)
+            stored.pendingApprovalJSON = json
+            context.insert(stored)
+        }
+        try? context.save()
+    }
+
     private func storedSession(id: String, profileID: String) -> StoredSession? {
         let predicate = #Predicate<StoredSession> {
             $0.id == id && $0.profileID == profileID

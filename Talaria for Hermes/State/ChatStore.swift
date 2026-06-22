@@ -651,6 +651,9 @@ final class ChatStore {
         case .runsApprovalRequired(let req):
             // Surface the approval card; run is now paused server-side.
             pendingApproval = req
+            // Persist it so a relaunch can restore the card — the server replays
+            // neither the event nor the payload once we reconnect.
+            persistPendingApproval(req)
             rebuildTurns()
 
         case .runFailed(let error):
@@ -681,6 +684,8 @@ final class ChatStore {
         guard let approval = pendingApproval else { return }
         let runID = approval.runID
         pendingApproval = nil
+        // Answered — drop the persisted card so a relaunch mid-resume doesn't re-show it.
+        clearPersistedApproval()
         Task {
             try? await client.approveRun(runID: runID, choice: choice)
         }
@@ -719,10 +724,16 @@ final class ChatStore {
             if let status = try? await client.runStatus(runID: runID) {
                 switch status.status ?? "" {
                 case "waiting_for_approval":
-                    // Run is paused — we lost the approval event. Fetch the status
-                    // to reconstruct it. For now, just wait and retry so the user
-                    // doesn't get stuck forever.
-                    break
+                    // Run is paused — we lost the approval event. The status carries
+                    // no payload, so restore the card from local persistence; the
+                    // user's answer (approveRun) resumes the run and this loop then
+                    // picks up the completed reply from /messages.
+                    if pendingApproval == nil,
+                       let restored = loadPersistedApproval(runID: runID) {
+                        pendingApproval = restored
+                        reconnecting = false
+                        rebuildTurns()
+                    }
                 case "completed":
                     if let messages = try? await client.messages(sessionID: sessionID),
                        hasCompletedAssistantReply(in: messages) {
@@ -767,6 +778,33 @@ final class ChatStore {
 
     private func clearActiveRunID() {
         repository?.setActiveRunID(nil, sessionID: sessionID, profileID: profileID)
+        // A cleared run can have no outstanding approval — drop any persisted card.
+        clearPersistedApproval()
+    }
+
+    // MARK: - Pending approval persistence
+
+    /// Persists the approval the run is paused on so the card can be restored after
+    /// a relaunch (the server replays neither the event nor the payload).
+    private func persistPendingApproval(_ approval: ApprovalRequest) {
+        guard let json = try? JSONEncoder().encode(approval),
+              let str = String(data: json, encoding: .utf8) else { return }
+        repository?.setPendingApprovalJSON(str, sessionID: sessionID, profileID: profileID)
+    }
+
+    private func clearPersistedApproval() {
+        repository?.setPendingApprovalJSON(nil, sessionID: sessionID, profileID: profileID)
+    }
+
+    /// Loads a persisted approval for the given run, if one was saved and still
+    /// belongs to this run (guards against showing a stale card from a prior run).
+    private func loadPersistedApproval(runID: String) -> ApprovalRequest? {
+        guard let str = repository?.pendingApprovalJSON(sessionID: sessionID, profileID: profileID),
+              let data = str.data(using: .utf8),
+              let approval = try? JSONDecoder().decode(ApprovalRequest.self, from: data),
+              approval.runID == runID
+        else { return nil }
+        return approval
     }
 
     // MARK: - Runs API recovery on chat open
@@ -797,7 +835,28 @@ final class ChatStore {
         }
 
         switch status.status ?? "" {
-        case "waiting_for_approval", "running", "started":
+        case "waiting_for_approval":
+            // Run is paused awaiting an approval. The server replays neither the
+            // approval.request event nor its payload on reconnect, so restore the
+            // card from local persistence and wait for the user to answer — then
+            // reconnect for the tail. Without the restore, the card is lost forever.
+            currentRunID = runID
+            working = true
+            if pendingApproval == nil {
+                pendingApproval = loadPersistedApproval(runID: runID)
+            }
+            rebuildTurns()
+            if pendingApproval != nil {
+                await waitForApprovalAndReconnect(runID: runID)
+            } else {
+                // No locally-persisted payload (e.g. approval predates this build).
+                // Best effort: reconnect in case the server does replay; otherwise
+                // recovery falls back to polling /messages for the eventual reply.
+                reconnecting = true
+                await streamRunEvents(runID: runID, reconnectAfterApproval: true)
+                reconnecting = false
+            }
+        case "running", "started":
             // Run is live — reconnect to events for the tail.
             currentRunID = runID
             working = true

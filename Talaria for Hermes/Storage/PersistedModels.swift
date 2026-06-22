@@ -23,6 +23,13 @@ import SwiftData
     /// CloudKit rule: defaulted optional, no unique constraint.
     var activeRunID: String? = nil
 
+    /// JSON-encoded ApprovalRequest for an approval the run is currently paused on.
+    /// Persisted because the server neither replays the `approval.request` event on
+    /// reconnect nor exposes the approval payload via run status — so without this,
+    /// killing the app mid-approval loses the card on relaunch. Cleared when the
+    /// approval is answered or the run completes/fails. CloudKit: defaulted optional.
+    var pendingApprovalJSON: String? = nil
+
     @Relationship(deleteRule: .cascade, inverse: \StoredMessage.session)
     var messages: [StoredMessage]? = []
 
