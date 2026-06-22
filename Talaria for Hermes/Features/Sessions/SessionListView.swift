@@ -138,7 +138,13 @@ struct SessionListView: View {
                     requestDelete(session)
                 }
             } preview: {
-                SessionContextPreview(session: session, isPinned: isPinned(session))
+                // Lazily evaluated when the menu is shown, so the cache read only
+                // happens for the previewed session — never eagerly for every row.
+                SessionContextPreview(
+                    session: session,
+                    messages: previewMessages(for: session),
+                    isPinned: isPinned(session)
+                )
             }
             .swipeActions(edge: .trailing) {
                 Button("Delete", systemImage: "trash", role: .destructive) {
@@ -157,6 +163,15 @@ struct SessionListView: View {
                 .tint(.orange)
             }
         }
+    }
+
+    /// Locally cached messages for a session's chat-style context-menu preview.
+    /// Read-only and side-effect-free — never hits the network or kicks off recovery.
+    private func previewMessages(for session: Session) -> [TimelineMessage] {
+        appModel.repository?.messages(
+            sessionID: session.id,
+            profileID: appModel.activeProfile.id.uuidString
+        ) ?? []
     }
 
     private var pinnedSessions: [Session] {
