@@ -10,6 +10,7 @@ struct SessionListView: View {
     @State private var sessionToDelete: Session?
     @State private var sessionToRename: Session?
     @State private var renameText: String = ""
+    @State private var searchText: String = ""
 
     var body: some View {
         Group {
@@ -30,6 +31,11 @@ struct SessionListView: View {
                 }
             } else {
                 sessionList
+            }
+        }
+        .safeAreaInset(edge: .bottom) {
+            if !appModel.sessionStore.sessions.isEmpty {
+                sessionSearchBar
             }
         }
         .toolbar { toolbarContent }
@@ -59,6 +65,32 @@ struct SessionListView: View {
                 Button("New Session", systemImage: "plus", action: createSession)
             }
         }
+    }
+
+    private var sessionSearchBar: some View {
+        HStack(spacing: Spacing.s) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("Search sessions", text: $searchText)
+                .textFieldStyle(.plain)
+                .autocorrectionDisabled()
+                .submitLabel(.search)
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .padding(.horizontal, Spacing.m)
+        .padding(.vertical, Spacing.s)
+        .background(.regularMaterial, in: .rect(cornerRadius: Radii.large))
+        .padding(.horizontal, Spacing.m)
+        .padding(.bottom, Spacing.s)
     }
 
     private var loadingPlaceholder: some View {
@@ -124,12 +156,19 @@ struct SessionListView: View {
 
     private var pinnedSessions: [Session] {
         let sessionsByID = Dictionary(uniqueKeysWithValues: appModel.sessionStore.sessions.map { ($0.id, $0) })
-        return pinnedSessionIDs.compactMap { sessionsByID[$0] }
+        return filtered(pinnedSessionIDs.compactMap { sessionsByID[$0] })
     }
 
     private var unpinnedSessions: [Session] {
         let pinned = Set(pinnedSessionIDs)
-        return appModel.sessionStore.sessions.filter { !pinned.contains($0.id) }
+        return filtered(appModel.sessionStore.sessions.filter { !pinned.contains($0.id) })
+    }
+
+    /// Filters by the bottom search field, matching the session's display title.
+    private func filtered(_ sessions: [Session]) -> [Session] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return sessions }
+        return sessions.filter { $0.displayTitle.localizedCaseInsensitiveContains(query) }
     }
 
     private var pinnedSessionIDs: [String] {

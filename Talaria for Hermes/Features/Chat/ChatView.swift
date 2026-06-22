@@ -59,7 +59,7 @@ struct ChatView: View {
             )
         }
         .alert("Debug Info", isPresented: $showDebugInfo) {
-            Button("Copy") { UIPasteboard.general.string = debugInfoText }
+            Button("Copy") { UIPasteboard.general.string = debugInfoDetailed }
             Button("OK", role: .cancel) {}
         } message: {
             Text(debugInfoText)
@@ -213,8 +213,17 @@ struct ChatView: View {
         lines.append("Source: \(s.source ?? "—")")
         lines.append("Model: \(appModel.sessionModelID(for: s.id))")
         if let parent = s.parentSessionId { lines.append("Parent: \(parent)") }
+        let assistants = messages.filter { $0.message.role == "assistant" }
+        let emptyContent = assistants.filter { ($0.message.content ?? "").isEmpty }.count
+        let withReasoning = assistants.filter { !(($0.message.reasoning ?? $0.message.reasoningContent) ?? "").isEmpty }.count
+        let roleCounts = Dictionary(grouping: messages, by: { $0.message.role })
+            .mapValues(\.count).sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }.joined(separator: ", ")
+
         lines.append("Server messages: \(s.messageCount.map(String.init) ?? "—")")
         lines.append("Loaded messages: \(messages.count) (user \(userCount) / assistant \(assistantCount))")
+        lines.append("Roles: \(roleCounts)")
+        lines.append("Assistant empty-content: \(emptyContent), with-reasoning: \(withReasoning)")
         lines.append("Turns: \(store?.turns.count ?? 0)")
         lines.append("Last message role: \(lastRole)")
         lines.append("Run ID: \(store?.currentRunID ?? "—")")
@@ -224,6 +233,19 @@ struct ChatView: View {
         }
         lines.append("Session streaming: \(appModel.useSessionStream)")
         lines.append("Server: \(appModel.activeProfile.name) — \(appModel.activeProfile.url.absoluteString)")
+        return lines.joined(separator: "\n")
+    }
+
+    /// Verbose copy: the summary plus a per-message dump (role, content/reasoning
+    /// lengths, tool calls, finish reason) so a missing reply can be pinpointed.
+    private var debugInfoDetailed: String {
+        let messages = store?.timeline ?? []
+        var lines = [debugInfoText, "", "Messages:"]
+        for (i, tm) in messages.enumerated() {
+            let m = tm.message
+            let reasoningLen = ((m.reasoning ?? m.reasoningContent) ?? "").count
+            lines.append("[\(i)] \(m.role) content=\((m.content ?? "").count) reasoning=\(reasoningLen) tools=\(m.toolCalls?.count ?? 0) finish=\(m.finishReason ?? "-")")
+        }
         return lines.joined(separator: "\n")
     }
 

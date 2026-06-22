@@ -155,8 +155,22 @@ struct MessageTimelineWebView: View {
         html += userHTML(turn)
         html += assistantHTML(turn)
         html += indicatorHTML(turn, isLast: isLast)
+        html += noResponseHTML(turn, isLast: isLast)
         html += "</div>"
         return html
+    }
+
+    /// A finalized user turn with no assistant reply (the run errored or never
+    /// persisted a response — the inline error bubble is local-only and gone on
+    /// reload). Make it explicit so a bare user message doesn't look like a bug.
+    private func noResponseHTML(_ turn: ChatTurn, isLast: Bool) -> String {
+        let isLive = isLast && (store.working || store.reconnecting)
+        guard !isLive,
+              turn.userMessage.message.content?.isEmpty == false,
+              turn.blocks.isEmpty,
+              reasoningText(turn) == nil
+        else { return "" }
+        return "<div class=\"no-response\">\(Self.warnSVG)<span>No response recorded for this message.</span></div>"
     }
 
     private func userHTML(_ turn: ChatTurn) -> String {
@@ -317,6 +331,7 @@ struct MessageTimelineWebView: View {
     private static let wrenchSVG = #"<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18v3h3l6.3-6.3a4 4 0 0 0 5.4-5.4l-2.3 2.3-2.4-.6-.6-2.4 2.3-2.3z"/></svg>"#
     private static let brainSVG = #"<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3a3 3 0 0 0-3 3 3 3 0 0 0-2 5 3 3 0 0 0 1 5 3 3 0 0 0 5 1V4a1 1 0 0 0-1-1zm6 0a3 3 0 0 1 3 3 3 3 0 0 1 2 5 3 3 0 0 1-1 5 3 3 0 0 1-5 1V4a1 1 0 0 1 1-1z"/></svg>"#
     private static let docSVG = #"<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>"#
+    private static let warnSVG = #"<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>"#
 
     // MARK: - HTML shell
 
@@ -351,11 +366,13 @@ struct MessageTimelineWebView: View {
         #container {
           width: 100%; margin: 0;
           /* Inset by the safe area so content doesn't slide under the macOS sidebar
-             (reported as env(safe-area-inset-left)) or the home indicator/notch. */
-          padding-top: 16px;
-          padding-right: calc(16px + env(safe-area-inset-right));
+             (reported as env(safe-area-inset-left)) or the home indicator/notch. The
+             extra top inset keeps the first message from sliding under the nav bar in
+             a short chat. */
+          padding-top: calc(20px + env(safe-area-inset-top));
+          padding-right: calc(20px + env(safe-area-inset-right));
           padding-bottom: calc(16px + env(safe-area-inset-bottom));
-          padding-left: calc(16px + env(safe-area-inset-left));
+          padding-left: calc(20px + env(safe-area-inset-left));
         }
         .turn { margin-bottom: 16px; }
         .turn > * + * { margin-top: 12px; }
@@ -465,6 +482,8 @@ struct MessageTimelineWebView: View {
         @keyframes spin { to { transform: rotate(360deg); } }
         .shimmer { width: 60px; height: 12px; border-radius: 6px; background: linear-gradient(90deg, var(--quaternary), var(--secondary), var(--quaternary)); background-size: 200% 100%; animation: shimmer 1.3s linear infinite; }
         @keyframes shimmer { to { background-position: -200% 0; } }
+        .no-response { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--tertiary); font-style: italic; }
+        .no-response .ic { width: 14px; height: 14px; }
 
         /* Jump to latest */
         #jump {
@@ -491,8 +510,14 @@ struct MessageTimelineWebView: View {
           for (var i = 0; i < nodes.length; i++) {
             var el = nodes[i];
             var src = decodeURIComponent(el.getAttribute('data-md') || '');
-            if (md) { el.innerHTML = md.render(src); }
-            else { var d = document.createElement('div'); d.textContent = src; el.innerHTML = '<p>' + d.innerHTML + '</p>'; }
+            // Per-node try/catch: a single render failure must not blank every
+            // following message (they share one render pass on load).
+            try {
+              if (md) { el.innerHTML = md.render(src); }
+              else { var d = document.createElement('div'); d.textContent = src; el.innerHTML = '<p>' + d.innerHTML + '</p>'; }
+            } catch (e) {
+              var f = document.createElement('div'); f.textContent = src; el.innerHTML = '<p>' + f.innerHTML + '</p>';
+            }
             el.setAttribute('data-rendered', '1');
           }
         }
