@@ -23,7 +23,7 @@ struct ChatView: View {
     var body: some View {
         Group {
             if let store {
-                MessageTimelineView(store: store)
+                MessageTimelineWebView(store: store)
                     .safeAreaInset(edge: .bottom, spacing: 0) {
                         ChatComposer(
                             text: $draftText,

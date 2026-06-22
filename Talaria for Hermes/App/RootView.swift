@@ -39,6 +39,18 @@ struct RootView: View {
     }
 
     var body: some View {
+        #if DEBUG
+        if DebugHarness.isLongChatScenario {
+            DebugHarness.longChatRootView
+        } else {
+            standardBody
+        }
+        #else
+        standardBody
+        #endif
+    }
+
+    private var standardBody: some View {
         Group {
             if let appModel, !isInWelcomeFlow {
                 LoadedRootView(appModel: appModel)

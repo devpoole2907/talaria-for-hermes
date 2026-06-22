@@ -1053,6 +1053,12 @@ final class ChatStore {
     /// stream, so adopt it as recoverable work and poll for the final transcript.
     private func adoptExternalRunIfNeeded(from messages: [HermesMessage]) {
         guard !working, !awaitingResult, hasPendingAssistantReply(in: messages) else { return }
+        // Only adopt a run that could plausibly still be in flight. A conversation
+        // that simply *ends* on a user message — an aborted/failed turn, or one whose
+        // reply never persisted — must NOT trigger recovery, or opening that chat
+        // spins "reconnecting" for the whole recovery window, every single time. The
+        // trailing user message being recent is our only signal a run is live.
+        guard lastUserMessageIsRecent(in: messages) else { return }
 
         awaitingResult = true
         receivedRunCompleted = false
@@ -1060,6 +1066,15 @@ final class ChatStore {
         currentRunID = nil
         lastError = nil
         recoverIfNeeded()
+    }
+
+    /// True when the conversation's last user message is recent enough that a run
+    /// started for it could still be running server-side. Beyond the recovery
+    /// window, an unanswered user message is a dead turn, not a live one.
+    private func lastUserMessageIsRecent(in messages: [HermesMessage]) -> Bool {
+        guard let lastUser = messages.last(where: { $0.role == "user" }),
+              let timestamp = lastUser.timestamp else { return false }
+        return Date.now.timeIntervalSince1970 - timestamp < Self.recoveryWindow
     }
 
     /// Recovers a turn whose live stream dropped before completing (app suspended,
@@ -1120,7 +1135,10 @@ final class ChatStore {
         }
         let start = messages.index(after: lastUserIdx)
         guard start < messages.endIndex else { return true }
-        return !messages[start...].contains { $0.role == "assistant" && $0.hasVisibleContent }
+        // Completion is atomic — the whole transcript lands at once — so *any*
+        // assistant message after the user (even a tool-only one with no visible
+        // text) means the run finished. Only a bare trailing user message is pending.
+        return !messages[start...].contains { $0.role == "assistant" }
     }
 
     /// Finalizes the in-flight turn from the authoritative `/messages` list.
@@ -1185,3 +1203,77 @@ private extension HermesMessage {
         || reasoningContent?.isEmpty == false
     }
 }
+
+#if DEBUG
+// MARK: - Debug harness hooks
+//
+// Backend-free seams so the timeline (scrolling, windowing, vanishing-on-append)
+// can be exercised in the running simulator without a live Hermes server. Lives
+// in this file so it can reach `rebuildTurns()` and the private streaming state.
+// Compiled out of release builds.
+extension ChatStore {
+    /// Replaces the timeline with `count` synthetic user/assistant turns and
+    /// rebuilds, so the view opens on a long conversation pinned to the bottom.
+    func debugSeedLongChat(turnCount count: Int) {
+        var messages: [TimelineMessage] = []
+        let base = Date.now.timeIntervalSince1970 - Double(count) * 120
+        for i in 0..<count {
+            let t = base + Double(i) * 120
+            messages.append(TimelineMessage(message: HermesMessage(
+                id: i * 2, sessionId: sessionID, role: "user",
+                content: "Turn \(i + 1): what's the status on item #\(i + 1)? Give me the short version.",
+                toolCalls: nil, toolCallId: nil, toolName: nil,
+                timestamp: t, finishReason: nil, reasoning: nil, reasoningContent: nil
+            )))
+            messages.append(TimelineMessage(message: HermesMessage(
+                id: i * 2 + 1, sessionId: sessionID, role: "assistant",
+                content: """
+                Reply \(i + 1). Item #\(i + 1) is on track.
+
+                - First point about item \(i + 1).
+                - Second point with a bit more detail so the bubble has real height.
+                - Third point to round it out.
+                """,
+                toolCalls: nil, toolCallId: nil, toolName: nil,
+                timestamp: t + 30, finishReason: "stop", reasoning: nil, reasoningContent: nil
+            )))
+        }
+        timeline = messages
+        loading = false
+        debugRebuildTurns()
+    }
+
+    /// Simulates a send: appends a user turn with `working = true` (the exact moment
+    /// the vanishing bug struck), then lands an assistant reply a beat later — no
+    /// network involved. Tap the harness button after scrolling up to test the snap.
+    func debugSimulateSend() {
+        let n = timeline.lazy.filter { $0.message.role == "user" }.count + 1
+        timeline.append(TimelineMessage(message: HermesMessage(
+            id: nil, sessionId: sessionID, role: "user",
+            content: "Debug send #\(n) — this message must stay visible after sending.",
+            toolCalls: nil, toolCallId: nil, toolName: nil,
+            timestamp: Date.now.timeIntervalSince1970, finishReason: nil,
+            reasoning: nil, reasoningContent: nil
+        )))
+        working = true
+        debugRebuildTurns()
+
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1))
+            timeline.append(TimelineMessage(message: HermesMessage(
+                id: nil, sessionId: sessionID, role: "assistant",
+                content: "Reply to debug send #\(n). If you can read this and the message above, the turn did not vanish.",
+                toolCalls: nil, toolCallId: nil, toolName: nil,
+                timestamp: Date.now.timeIntervalSince1970, finishReason: "stop",
+                reasoning: nil, reasoningContent: nil
+            )))
+            working = false
+            debugRebuildTurns()
+        }
+    }
+
+    /// Private `rebuildTurns()` is reachable here (same file); expose it under a
+    /// debug name for the harness hooks above.
+    private func debugRebuildTurns() { rebuildTurns() }
+}
+#endif
