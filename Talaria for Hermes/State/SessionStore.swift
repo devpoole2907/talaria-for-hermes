@@ -9,9 +9,22 @@ final class SessionStore {
     var lastError: HermesError?
 
     private let client: HermesClient
+    private let repository: ChatRepository?
+    private let profileID: String
 
-    init(client: HermesClient) {
+    init(client: HermesClient, repository: ChatRepository? = nil, profileID: String = "") {
         self.client = client
+        self.repository = repository
+        self.profileID = profileID
+
+        // Populate from local store immediately so the sessions list is non-empty
+        // on the very first frame (before the network refresh completes).
+        if let repository, !profileID.isEmpty {
+            let local = repository.sessions(profileID: profileID)
+            if !local.isEmpty {
+                self.sessions = local
+            }
+        }
     }
 
     func refresh() async {
@@ -23,6 +36,10 @@ final class SessionStore {
                 let l = lhs.lastActive ?? lhs.startedAt ?? 0
                 let r = rhs.lastActive ?? rhs.startedAt ?? 0
                 return l > r
+            }
+            // Persist the refreshed session list for instant next-launch display.
+            if !profileID.isEmpty {
+                repository?.upsertSessions(sessions, profileID: profileID)
             }
         } catch {
             lastError = HermesError(error)
@@ -60,6 +77,10 @@ final class SessionStore {
     func delete(_ session: Session) async throws {
         try await client.deleteSession(id: session.id)
         sessions.removeAll { $0.id == session.id }
+        // Remove locally persisted messages and session entry (cascade delete).
+        if !profileID.isEmpty {
+            repository?.deleteSession(id: session.id, profileID: profileID)
+        }
     }
 
     func bumpLastActive(for sessionID: String) {

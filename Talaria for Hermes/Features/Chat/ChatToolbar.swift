@@ -6,6 +6,7 @@ struct ChatToolbar: ToolbarContent {
     let isPinned: Bool
     @Binding var showRenameAlert: Bool
     @Binding var showModelPicker: Bool
+    @Binding var showDebugInfo: Bool
     var onCreateSession: () -> Void
     var onTogglePinned: () -> Void
     var onShowTools: () -> Void = {}
@@ -41,6 +42,10 @@ struct ChatToolbar: ToolbarContent {
                     systemImage: isPinned ? "pin.slash" : "pin",
                     action: onTogglePinned
                 )
+
+                Section {
+                    Button("Info", systemImage: "info.circle", action: { showDebugInfo = true })
+                }
             }
             .accessibilityLabel("Session actions")
         }

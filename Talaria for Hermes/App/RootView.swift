@@ -8,9 +8,16 @@ struct RootView: View {
     @State private var isInWelcomeFlow: Bool
     @State private var setupTarget: SetupTarget?
 
+    /// Shared persistence repository, built once from preferences so the same
+    /// ModelContainer is used across the whole app lifecycle.
+    private let repository: ChatRepository?
+
     init() {
         let preferences = AppPreferences()
         let profileStore = ServerProfileStore()
+        let persistenceController = try? PersistenceController(iCloudSyncEnabled: preferences.iCloudSyncEnabled)
+        let repository = persistenceController.map { ChatRepository(container: $0.container) }
+        self.repository = repository
         _preferences = State(initialValue: preferences)
         _profileStore = State(initialValue: profileStore)
 
@@ -27,7 +34,7 @@ struct RootView: View {
             active = profiles.first
         }
         if let active {
-            _appModel = State(initialValue: AppModel(profile: active, preferences: preferences, profileStore: profileStore))
+            _appModel = State(initialValue: AppModel(profile: active, preferences: preferences, profileStore: profileStore, repository: repository))
             _configuredProfile = State(initialValue: active)
             _isInWelcomeFlow = State(initialValue: false)
         } else {
@@ -39,6 +46,18 @@ struct RootView: View {
     }
 
     var body: some View {
+        #if DEBUG
+        if DebugHarness.isLongChatScenario {
+            DebugHarness.longChatRootView
+        } else {
+            standardBody
+        }
+        #else
+        standardBody
+        #endif
+    }
+
+    private var standardBody: some View {
         Group {
             if let appModel, !isInWelcomeFlow {
                 LoadedRootView(appModel: appModel)
@@ -82,7 +101,7 @@ struct RootView: View {
     private func completeSetup(_ profile: ServerProfile) throws {
         try profileStore.save(profile)
         preferences.activeProfileID = profile.id
-        let model = AppModel(profile: profile, preferences: preferences, profileStore: profileStore)
+        let model = AppModel(profile: profile, preferences: preferences, profileStore: profileStore, repository: repository)
         withAnimation {
             configuredProfile = profile
             appModel = model
@@ -95,7 +114,7 @@ struct RootView: View {
     private func completeDashboardSetup(_ profile: ServerProfile) throws {
         try profileStore.save(profile)
         preferences.activeProfileID = profile.id
-        let model = AppModel(profile: profile, preferences: preferences, profileStore: profileStore)
+        let model = AppModel(profile: profile, preferences: preferences, profileStore: profileStore, repository: repository)
         withAnimation {
             configuredProfile = profile
             appModel = model

@@ -1,5 +1,6 @@
 import PhotosUI
 import SwiftUI
+import UIKit
 
 struct ChatView: View {
     let session: Session
@@ -11,6 +12,7 @@ struct ChatView: View {
     @State private var store: ChatStore?
     @State private var showRename: Bool = false
     @State private var showModelPicker: Bool = false
+    @State private var showDebugInfo: Bool = false
     @State private var renameText: String = ""
     @State private var draftText: String = ""
     @State private var errorMessage: String?
@@ -23,19 +25,30 @@ struct ChatView: View {
     var body: some View {
         Group {
             if let store {
-                MessageTimelineView(store: store)
+                MessageTimelineWebView(store: store)
                     .safeAreaInset(edge: .bottom, spacing: 0) {
-                        ChatComposer(
-                            text: $draftText,
-                            attachments: $attachments,
-                            isWorking: store.working,
-                            onSend: { text in
-                                Task { await self.send(text, store: store) }
-                            },
-                            onStop: { store.stop() },
-                            onAttachPhoto: { showPhotoPicker = true },
-                            onAttachFile: { showFilePicker = true }
-                        )
+                        VStack(spacing: 0) {
+                            // Actionable approval card (Runs API path only).
+                            // Shown above the composer when the agent is waiting for consent.
+                            if let approval = store.pendingApproval {
+                                ApprovalCardView(approval: approval) { choice in
+                                    store.approveRun(choice: choice)
+                                }
+                                .transition(.move(edge: .bottom).combined(with: .opacity))
+                            }
+                            ChatComposer(
+                                text: $draftText,
+                                attachments: $attachments,
+                                isWorking: store.working,
+                                onSend: { text in
+                                    Task { await self.send(text, store: store) }
+                                },
+                                onStop: { store.stop() },
+                                onAttachPhoto: { showPhotoPicker = true },
+                                onAttachFile: { showFilePicker = true }
+                            )
+                        }
+                        .animation(.easeInOut(duration: 0.25), value: store.pendingApproval != nil)
                     }
             } else {
                 ProgressView()
@@ -50,10 +63,17 @@ struct ChatView: View {
                 isPinned: isPinned,
                 showRenameAlert: $showRename,
                 showModelPicker: $showModelPicker,
+                showDebugInfo: $showDebugInfo,
                 onCreateSession: createSession,
                 onTogglePinned: togglePinned,
                 onShowTools: onShowTools
             )
+        }
+        .alert("Debug Info", isPresented: $showDebugInfo) {
+            Button("Copy") { UIPasteboard.general.string = debugInfoDetailed }
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(debugInfoText)
         }
         .alert("Rename Session", isPresented: $showRename) {
             TextField("Name", text: $renameText)
@@ -81,7 +101,13 @@ struct ChatView: View {
         .onChange(of: scenePhase) { _, phase in
             // Returning to the foreground: resume any run whose stream was dropped
             // while the app was suspended, instead of leaving it stuck.
-            if phase == .active { store?.recoverIfNeeded() }
+            if phase == .active {
+                if store?.useRunsAPI == true {
+                    store?.recoverRunsAPIRunIfNeeded()
+                } else {
+                    store?.recoverIfNeeded()
+                }
+            }
         }
         .onChange(of: draftText) { _, newValue in
             appModel.preferences.setDraftText(newValue, for: session.id)
@@ -188,6 +214,58 @@ struct ChatView: View {
         appModel.sessionStore.session(id: session.id) ?? session
     }
 
+    /// Human-readable debug snapshot for the Info alert. Surfaces the session id plus
+    /// the local vs. server message picture (useful when an agent reply is missing on
+    /// load) and the run/connection state.
+    private var debugInfoText: String {
+        let s = currentSession
+        let messages = store?.timeline ?? []
+        let assistantCount = messages.filter { $0.message.role == "assistant" }.count
+        let userCount = messages.filter { $0.message.role == "user" }.count
+        let lastRole = messages.last?.message.role ?? "—"
+
+        var lines: [String] = []
+        lines.append("Session ID: \(s.id)")
+        lines.append("Title: \(s.title ?? "—")")
+        lines.append("Source: \(s.source ?? "—")")
+        lines.append("Model: \(appModel.sessionModelID(for: s.id))")
+        if let parent = s.parentSessionId { lines.append("Parent: \(parent)") }
+        let assistants = messages.filter { $0.message.role == "assistant" }
+        let emptyContent = assistants.filter { ($0.message.content ?? "").isEmpty }.count
+        let withReasoning = assistants.filter { !(($0.message.reasoning ?? $0.message.reasoningContent) ?? "").isEmpty }.count
+        let roleCounts = Dictionary(grouping: messages, by: { $0.message.role })
+            .mapValues(\.count).sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }.joined(separator: ", ")
+
+        lines.append("Server messages: \(s.messageCount.map(String.init) ?? "—")")
+        lines.append("Loaded messages: \(messages.count) (user \(userCount) / assistant \(assistantCount))")
+        lines.append("Roles: \(roleCounts)")
+        lines.append("Assistant empty-content: \(emptyContent), with-reasoning: \(withReasoning)")
+        lines.append("Turns: \(store?.turns.count ?? 0)")
+        lines.append("Last message role: \(lastRole)")
+        lines.append("Run ID: \(store?.currentRunID ?? "—")")
+        lines.append("State: working=\(store?.working ?? false) reconnecting=\(store?.reconnecting ?? false) loading=\(store?.loading ?? false)")
+        if let usage = store?.lastUsage {
+            lines.append("Last usage: in \(usage.input ?? 0) / out \(usage.output ?? 0)")
+        }
+        lines.append("Session streaming: \(appModel.useSessionStream)")
+        lines.append("Server: \(appModel.activeProfile.name) — \(appModel.activeProfile.url.absoluteString)")
+        return lines.joined(separator: "\n")
+    }
+
+    /// Verbose copy: the summary plus a per-message dump (role, content/reasoning
+    /// lengths, tool calls, finish reason) so a missing reply can be pinpointed.
+    private var debugInfoDetailed: String {
+        let messages = store?.timeline ?? []
+        var lines = [debugInfoText, "", "Messages:"]
+        for (i, tm) in messages.enumerated() {
+            let m = tm.message
+            let reasoningLen = ((m.reasoning ?? m.reasoningContent) ?? "").count
+            lines.append("[\(i)] \(m.role) content=\((m.content ?? "").count) reasoning=\(reasoningLen) tools=\(m.toolCalls?.count ?? 0) finish=\(m.finishReason ?? "-")")
+        }
+        return lines.joined(separator: "\n")
+    }
+
     @Sendable
     private func loadStore() async {
         let chatStore = appModel.openChat(for: session)
@@ -197,7 +275,12 @@ struct ChatView: View {
             await chatStore.load()
             errorMessage = chatStore.lastError?.errorDescription
         }
-        chatStore.recoverIfNeeded()
+        // Recovery: load() already calls recoverRunsAPIRunIfNeeded() or
+        // adoptExternalRunIfNeeded() based on the flag. Call recoverIfNeeded()
+        // to also handle foreground re-entry on the session-stream path.
+        if !chatStore.useRunsAPI {
+            chatStore.recoverIfNeeded()
+        }
     }
 
     private func send(_ text: String, store: ChatStore) async {

@@ -17,6 +17,9 @@ final class AppModel {
     /// turns (multi-agent workflows) can't run on each other's model. See ModelGate.
     let modelGate = ModelGate()
 
+    /// Local-first persistence repository with optional CloudKit sync.
+    private(set) var repository: ChatRepository?
+
     var serverHealth: HealthInfo?
     var capabilities: Capabilities?
     var startupError: HermesError?
@@ -25,7 +28,8 @@ final class AppModel {
     init(
         profile: ServerProfile,
         preferences: AppPreferences,
-        profileStore: ServerProfileStore
+        profileStore: ServerProfileStore,
+        repository: ChatRepository? = nil
     ) {
         self.activeProfile = profile
         self.preferences = preferences
@@ -34,7 +38,10 @@ final class AppModel {
 
         let c = Self.makeClient(profile: profile, preferences: preferences)
         self.client = c
-        self.sessionStore = SessionStore(client: c)
+        // Accept an injected repository (e.g. from TalariaApp's shared container)
+        // or nil for the DEBUG harness / unit tests.
+        self.repository = repository
+        self.sessionStore = SessionStore(client: c, repository: repository, profileID: profile.id.uuidString)
         self.modelStore = ModelStore(client: c)
     }
 
@@ -78,7 +85,7 @@ final class AppModel {
             activeProfile = newProfile
             let c = Self.makeClient(profile: newProfile, preferences: preferences)
             client = c
-            sessionStore = SessionStore(client: c)
+            sessionStore = SessionStore(client: c, repository: repository, profileID: newProfile.id.uuidString)
             modelStore = ModelStore(client: c)
             preferences.activeProfileID = newProfile.id
         }
@@ -92,9 +99,12 @@ final class AppModel {
             return existing
         }
         let sessionID = session.id
+        let profileID = activeProfile.id.uuidString
         let store = ChatStore(
             client: client,
             sessionID: sessionID,
+            profileID: profileID,
+            repository: repository,
             onRunCompleted: { [weak self] _ in
                 Task { @MainActor [weak self] in
                     await self?.sessionStore.refresh()

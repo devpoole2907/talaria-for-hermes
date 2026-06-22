@@ -92,6 +92,15 @@ struct TimelineMessage: Identifiable, Hashable, Sendable {
         self.fileAttachmentNames = fileAttachmentNames
     }
 
+    /// Reconstructs a TimelineMessage with a pre-existing local UUID, so the
+    /// SwiftUI identity matches the one stored in SwiftData across reloads.
+    init(storedLocalID: UUID, message: HermesMessage) {
+        self.localID = storedLocalID
+        self.message = message
+        self.imageAttachments = []
+        self.fileAttachmentNames = []
+    }
+
     var id: UUID { localID }
 }
 

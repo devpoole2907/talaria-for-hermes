@@ -18,6 +18,7 @@ struct SettingsView: View {
             List {
                 profilesSection
                 activeServerSection
+                syncSection
                 healthSection
                 capabilitiesSection
                 notificationsSection
@@ -101,6 +102,18 @@ struct SettingsView: View {
             if let adminURL = appModel.activeProfile.adminURL {
                 LabeledContent("Dashboard", value: adminURL.absoluteString)
             }
+        }
+    }
+
+    private var syncSection: some View {
+        @Bindable var preferences = appModel.preferences
+
+        return Section {
+            Toggle(isOn: $preferences.iCloudSyncEnabled) {
+                Label("iCloud Sync", systemImage: "icloud")
+            }
+        } footer: {
+            Text("Syncs cached sessions and messages through iCloud on devices using the same Apple Account. Changes apply after restarting Talaria.")
         }
     }
 

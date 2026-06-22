@@ -89,6 +89,21 @@ final class ChatStore {
     var lastUsage: TokenUsage?
     private(set) var streamingRevision = 0
 
+    // MARK: - Runs API approval state
+    //
+    // When the Runs API emits `approval.request`, the run pauses server-side.
+    // We surface an actionable card so the user can choose. Once they choose,
+    // we POST the choice and wait for the run to complete (it re-emits events
+    // on a new /events connection since the old SSE stream ended at the pause).
+    private(set) var pendingApproval: ApprovalRequest?
+
+    // MARK: - Runtime flag
+
+    /// When true, new turns use the Runs API (/v1/runs) instead of the session
+    /// chat stream. Defaults ON. Toggle via UserDefaults -UseRunsAPI 0 or the
+    /// feature flag in AppModel. Falls back to session-stream when OFF.
+    var useRunsAPI: Bool = UserDefaults.standard.object(forKey: "UseRunsAPI") as? Bool ?? true
+
     // Ephemeral streaming state
     private var streamingText: [String: String] = [:]
     private var streamingThinking: [String: String] = [:]
@@ -134,6 +149,18 @@ final class ChatStore {
     /// concurrent turns can't clobber each other's global model. See `ModelGate`.
     private let modelGate: ModelGate?
 
+    /// Optional SwiftData repository for local-first persistence and optional CloudKit sync.
+    /// nil in the DEBUG harness (no container there) and guards all write paths.
+    private let repository: ChatRepository?
+    /// The profile this session belongs to, used to scope SwiftData queries.
+    private let profileID: String
+
+    /// How often (in streaming revision ticks) to checkpoint the in-flight partial
+    /// to SwiftData. Every 16 ticks ≈ every ~16×14ms ≈ ~224ms — cheap enough not
+    /// to block the UI but frequent enough to capture meaningful progress on a drop.
+    private static let partialPersistInterval = 16
+    private var partialPersistTick = 0
+
     /// Model used for each completed turn, keyed by the turn's order index. Kept
     /// here (not on the wire message, which has no model field) so labels stay
     /// correct across the per-turn timeline rebuilds that `runCompleted` triggers.
@@ -141,9 +168,17 @@ final class ChatStore {
     /// Model resolved for the in-flight turn (set by `onTurnStart`).
     private var currentTurnModelID: String?
 
+    /// Stable local id for the current turn's streamed partial, so the throttled
+    /// `upsertPartial` writes UPDATE one row instead of inserting a new one each tick
+    /// (which would otherwise pile up N progressively-longer partials that reload as
+    /// duplicated, cumulative text). Reset on each send.
+    private var currentPartialLocalID: UUID?
+
     init(
         client: HermesClient,
         sessionID: String,
+        profileID: String = "",
+        repository: ChatRepository? = nil,
         onRunCompleted: @escaping @MainActor @Sendable (String) -> Void = { _ in },
         onTurnStart: (@MainActor @Sendable () async -> String?)? = nil,
         persistTurnModel: (@MainActor @Sendable (Int, String) -> Void)? = nil,
@@ -152,11 +187,23 @@ final class ChatStore {
     ) {
         self.client = client
         self.sessionID = sessionID
+        self.profileID = profileID
+        self.repository = repository
         self.onRunCompleted = onRunCompleted
         self.onTurnStart = onTurnStart
         self.persistTurnModel = persistTurnModel
         self.turnModelForIndex = turnModelForIndex
         self.modelGate = modelGate
+
+        // Load local timeline immediately so the chat shows prior content
+        // before the network fetch returns. Repository is nil in debug harness.
+        if let repository {
+            let local = repository.messages(sessionID: sessionID, profileID: profileID)
+            if !local.isEmpty {
+                self.timeline = local
+                rebuildTurns()
+            }
+        }
     }
 
     // MARK: - Loading
@@ -167,9 +214,19 @@ final class ChatStore {
         defer { loading = false }
         do {
             let messages = try await client.messages(sessionID: sessionID)
-            timeline = messages.map { TimelineMessage(message: $0) }
+            let serverTimeline = messages.map { TimelineMessage(message: $0) }
+            // Merge: local may have a partial assistant reply the server doesn't;
+            // keep it unless the server has a complete reply for that turn.
+            timeline = mergeServer(serverTimeline, withLocal: timeline)
             rebuildTurns()
-            adoptExternalRunIfNeeded(from: messages)
+            if useRunsAPI {
+                // On the Runs path, recover via persisted run_id if one exists.
+                recoverRunsAPIRunIfNeeded()
+            } else {
+                adoptExternalRunIfNeeded(from: messages)
+            }
+            // Persist the merged truth so the next cold launch is instant.
+            repository?.upsertMessages(timeline, sessionID: sessionID, profileID: profileID)
         } catch {
             let mapped = HermesError(error)
             // Cancellation is routine (view churn / navigation); never surface it to the user.
@@ -207,6 +264,8 @@ final class ChatStore {
         reconnecting = false
         lastError = nil
         currentRunID = nil
+        currentPartialLocalID = nil
+        pendingApproval = nil
         streamingText.removeAll()
         streamingThinking.removeAll()
         liveTools.removeAll()
@@ -249,12 +308,20 @@ final class ChatStore {
         let agentText = ([text] + fileRefs).filter { !$0.isEmpty }.joined(separator: "\n\n")
         let input = HermesChatInput.make(text: agentText, attachments: attachments)
 
+        // Persist the user message immediately so it survives a crash before the
+        // server acknowledges it. The assistant partial will follow from streaming.
+        repository?.upsertMessages(timeline, sessionID: sessionID, profileID: profileID)
+
         recoveryTask?.cancel()
         recoveryTask = nil
         streamTask?.cancel()
         streamTask = Task { [weak self] in
             guard let self else { return }
-            await self.runStream(input: input, uploadIDs: uploadIDs)
+            if self.useRunsAPI {
+                await self.runStreamViaRunsAPI(agentText: agentText, input: input, uploadIDs: uploadIDs)
+            } else {
+                await self.runStream(input: input, uploadIDs: uploadIDs)
+            }
         }
     }
 
@@ -378,6 +445,380 @@ final class ChatStore {
         }
     }
 
+    // MARK: - Runs API streaming path
+
+    /// Sends a turn via the Runs API: fetches history, creates a run, persists the
+    /// run_id, streams events, handles approvals, and finalizes from /messages.
+    private func runStreamViaRunsAPI(agentText: String, input: HermesChatInput, uploadIDs: [String] = []) async {
+        defer {
+            if !uploadIDs.isEmpty {
+                Task { [client] in
+                    for id in uploadIDs { try? await client.deleteAttachment(id: id) }
+                }
+            }
+        }
+
+        // Acquire model gate and prepare the session model (same as session-stream path).
+        await modelGate?.acquire()
+        var gateReleased = false
+        func releaseGate() {
+            guard !gateReleased else { return }
+            gateReleased = true
+            modelGate?.release()
+        }
+
+        currentTurnModelID = await onTurnStart?() ?? nil
+        if let model = currentTurnModelID {
+            turnModelByIndex[lastTurnIndex] = model
+            persistTurnModel?(lastTurnIndex, model)
+        }
+        guard !Task.isCancelled else { releaseGate(); working = false; awaitingResult = false; return }
+
+        // Fetch conversation history before creating the run — the Runs handler
+        // does NOT auto-load session history, so we must supply it.
+        let conversationHistory: [[String: String]]
+        do {
+            let serverMessages = try await client.messages(sessionID: sessionID)
+            // Build role+content pairs, filtering only user and assistant messages
+            // (tool-call messages aren't meaningful context for the Runs handler).
+            conversationHistory = serverMessages.compactMap { msg -> [String: String]? in
+                guard msg.role == "user" || msg.role == "assistant",
+                      let content = msg.content, !content.isEmpty
+                else { return nil }
+                return ["role": msg.role, "content": content]
+            }
+        } catch {
+            releaseGate()
+            lastError = HermesError(error)
+            working = false
+            awaitingResult = false
+            rebuildTurns()
+            return
+        }
+        guard !Task.isCancelled else { releaseGate(); working = false; awaitingResult = false; return }
+
+        // Create the run. For text-only turns use the simple string input; for
+        // multimodal turns use the array form (image_url parts).
+        // TODO: verify image_url support on /v1/runs against the live server.
+        let runID: String
+        do {
+            switch input {
+            case .text(let txt):
+                runID = try await client.createRun(
+                    sessionID: sessionID,
+                    input: txt,
+                    model: currentTurnModelID,
+                    conversationHistory: conversationHistory
+                )
+            case .parts:
+                runID = try await client.createRunMultimodal(
+                    sessionID: sessionID,
+                    input: input,
+                    model: currentTurnModelID,
+                    conversationHistory: conversationHistory
+                )
+            }
+        } catch {
+            releaseGate()
+            let mapped = HermesError(error)
+            if let inline = mapped.inlineChatMessage {
+                commitErrorResponse(inline)
+                working = false
+                awaitingResult = false
+                rebuildTurns()
+            } else {
+                lastError = mapped
+                working = false
+                awaitingResult = false
+                rebuildTurns()
+            }
+            return
+        }
+        guard !Task.isCancelled else { releaseGate(); working = false; awaitingResult = false; return }
+
+        // Persist the run_id so recovery survives a relaunch.
+        currentRunID = runID
+        persistActiveRunID(runID)
+        rebuildTurns()
+
+        // Release the kickoff gate — model is now bound to this run.
+        releaseGate()
+
+        // Stream events and handle approvals in a loop. After an approval is
+        // posted, the server drops the /events connection; we reconnect once to
+        // catch the tail. (No server-side event replay — reconnect gets the tail.)
+        await streamRunEvents(runID: runID, reconnectAfterApproval: true)
+    }
+
+    /// Streams events from /v1/runs/{runID}/events, processes them, and on
+    /// completion (or drop) finalizes via /messages. If the run pauses for
+    /// approval and `reconnectAfterApproval` is true, waits for the approval to
+    /// be answered then reconnects to the same run's events.
+    private func streamRunEvents(runID: String, reconnectAfterApproval: Bool) async {
+        let stream = client.runEvents(runID: runID)
+        var hitApproval = false
+        var hitCompleted = false
+
+        do {
+            for try await event in stream {
+                if Task.isCancelled { return }
+                await processRunsEvent(event, runID: runID)
+                if case .runsApprovalRequired = event {
+                    hitApproval = true
+                    // The server pauses; the stream ends here (no more events until approved).
+                    break
+                }
+                if case .runCompleted = event {
+                    hitCompleted = true
+                    break
+                }
+                if case .runFailed = event {
+                    hitCompleted = true
+                    break
+                }
+            }
+        } catch {
+            guard !Task.isCancelled else { return }
+            let mapped = HermesError(error)
+            // "Not found" after approval is expected — the stream ended at the pause.
+            // Fall through to the reconnect logic.
+            if mapped != .notFound && mapped != .cancelled {
+                // Surface inline if it's a model/run error with body; else silent drop.
+                if let inline = mapped.inlineChatMessage {
+                    commitErrorResponse(inline)
+                    working = false
+                    awaitingResult = false
+                    rebuildTurns()
+                    clearActiveRunID()
+                    return
+                }
+                // Otherwise treat as a dropped connection — recover via messages endpoint.
+            }
+        }
+
+        if hitCompleted {
+            // run.completed received — fetch authoritative messages.
+            await finalizeRunFromMessages()
+            return
+        }
+
+        if hitApproval && reconnectAfterApproval {
+            // Wait for the approval card to be dismissed (user picked a choice).
+            // pendingApproval is cleared by approveRun(choice:) which also resumes the run.
+            // After approval is posted, reconnect once to get the tail events.
+            await waitForApprovalAndReconnect(runID: runID)
+            return
+        }
+
+        // Stream ended without runCompleted (dropped connection) — recover via messages.
+        await recoverInterruptedRunsRun(runID: runID)
+    }
+
+    /// Waits until the pending approval is cleared (user answered), then reconnects
+    /// to /events for the tail, and finalizes.
+    private func waitForApprovalAndReconnect(runID: String) async {
+        // Poll in a tight loop for approval dismissal (pendingApproval == nil).
+        // The UI calls approveRun(choice:) which clears pendingApproval and posts
+        // the choice; we then reconnect.
+        while pendingApproval != nil {
+            guard !Task.isCancelled else { return }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        guard !Task.isCancelled else { return }
+
+        // Small delay to allow the server to process the approval before we reconnect.
+        try? await Task.sleep(for: .milliseconds(300))
+
+        // Reconnect for the tail. reconnectAfterApproval=false so we don't loop infinitely.
+        await streamRunEvents(runID: runID, reconnectAfterApproval: false)
+    }
+
+    /// Processes a single Runs API event. Mirrors `process()` for the session-stream path.
+    private func processRunsEvent(_ event: HermesStreamEvent, runID: String) async {
+        switch event {
+        case .assistantDelta(let msgID, let text):
+            await revealAssistantText(messageID: msgID, text: text)
+
+        case .thinkingDelta(let msgID, let text):
+            await revealThinkingText(messageID: msgID, text: text)
+
+        case .runCompleted(_, let usage):
+            // Don't finalize yet — caller drives finalization after stream ends.
+            lastUsage = usage
+            needsCompletionRefresh = true
+            receivedRunCompleted = true
+
+        case .runsApprovalRequired(let req):
+            // Surface the approval card; run is now paused server-side.
+            pendingApproval = req
+            rebuildTurns()
+
+        case .runFailed(let error):
+            commitErrorResponse(error)
+            working = false
+            reconnecting = false
+            awaitingResult = false
+            streamingText.removeAll()
+            streamingThinking.removeAll()
+            liveTools.removeAll()
+            liveBlocks.removeAll()
+            currentStreamMsgID = nil
+            clearActiveRunID()
+            rebuildTurns()
+
+        default:
+            // Delegate tool events, runStarted, etc. to the shared apply() path.
+            apply(event)
+            if event.isDiscreteStreamingEvent {
+                await yieldStreamingFrame()
+            }
+        }
+    }
+
+    /// Posts an approval choice for the current pending approval.
+    /// Called from the approval UI; clears pendingApproval so the wait loop resumes.
+    func approveRun(choice: String) {
+        guard let approval = pendingApproval else { return }
+        let runID = approval.runID
+        pendingApproval = nil
+        Task {
+            try? await client.approveRun(runID: runID, choice: choice)
+        }
+    }
+
+    /// Finalizes the current Runs path turn by fetching the authoritative message list.
+    private func finalizeRunFromMessages() async {
+        if let messages = try? await client.messages(sessionID: sessionID),
+           hasCompletedAssistantReply(in: messages) {
+            await finalizeFromMessages(messages)
+        } else {
+            // Not complete yet — fall back to polling recovery.
+            await recoverInterruptedRunsRun(runID: currentRunID ?? "")
+        }
+        clearActiveRunID()
+    }
+
+    /// Recovery for a dropped Runs API stream: polls run status, then /messages.
+    private func recoverInterruptedRunsRun(runID: String) async {
+        guard awaitingResult, !recovering else { return }
+        recovering = true
+        reconnecting = true
+        working = true
+        rebuildTurns()
+        defer {
+            recovering = false
+            reconnecting = false
+        }
+
+        let deadline = Date.now.addingTimeInterval(Self.recoveryWindow)
+        var delay: Duration = .seconds(2)
+        while Date.now < deadline {
+            if Task.isCancelled { return }
+
+            // Check run status first.
+            if let status = try? await client.runStatus(runID: runID) {
+                switch status.status ?? "" {
+                case "waiting_for_approval":
+                    // Run is paused — we lost the approval event. Fetch the status
+                    // to reconstruct it. For now, just wait and retry so the user
+                    // doesn't get stuck forever.
+                    break
+                case "completed":
+                    if let messages = try? await client.messages(sessionID: sessionID),
+                       hasCompletedAssistantReply(in: messages) {
+                        await finalizeFromMessages(messages)
+                        clearActiveRunID()
+                        return
+                    }
+                case "failed":
+                    working = false
+                    awaitingResult = false
+                    reconnecting = false
+                    clearActiveRunID()
+                    rebuildTurns()
+                    return
+                default:
+                    // still running — also check messages in case
+                    break
+                }
+            }
+
+            if let messages = try? await client.messages(sessionID: sessionID),
+               hasCompletedAssistantReply(in: messages) {
+                await finalizeFromMessages(messages)
+                clearActiveRunID()
+                return
+            }
+            try? await Task.sleep(for: delay)
+            delay = min(delay * 2, .seconds(8))
+        }
+
+        guard !receivedRunCompleted else { return }
+        working = false
+        clearActiveRunID()
+        rebuildTurns()
+    }
+
+    // MARK: - Run ID persistence
+
+    private func persistActiveRunID(_ runID: String) {
+        repository?.setActiveRunID(runID, sessionID: sessionID, profileID: profileID)
+    }
+
+    private func clearActiveRunID() {
+        repository?.setActiveRunID(nil, sessionID: sessionID, profileID: profileID)
+    }
+
+    // MARK: - Runs API recovery on chat open
+
+    /// Called on chat open (after `load()`): if there's a persisted run_id that's
+    /// still running or waiting for approval, reconnect to its events stream.
+    func recoverRunsAPIRunIfNeeded() {
+        guard useRunsAPI, !working, !awaitingResult else { return }
+        guard let persistedRunID = repository?.activeRunID(sessionID: sessionID, profileID: profileID),
+              !persistedRunID.isEmpty
+        else { return }
+
+        awaitingResult = true
+        recovering = false
+        recoveryTask?.cancel()
+        recoveryTask = Task { [weak self] in
+            guard let self else { return }
+            await self.reconnectToPersistedRun(runID: persistedRunID)
+            self.recoveryTask = nil
+        }
+    }
+
+    private func reconnectToPersistedRun(runID: String) async {
+        guard let status = try? await client.runStatus(runID: runID) else {
+            // Can't reach server — fall back to messages polling.
+            await recoverInterruptedRunsRun(runID: runID)
+            return
+        }
+
+        switch status.status ?? "" {
+        case "waiting_for_approval", "running", "started":
+            // Run is live — reconnect to events for the tail.
+            currentRunID = runID
+            working = true
+            reconnecting = true
+            rebuildTurns()
+            await streamRunEvents(runID: runID, reconnectAfterApproval: true)
+            reconnecting = false
+        case "completed":
+            // Already done; just load from messages.
+            if let messages = try? await client.messages(sessionID: sessionID),
+               hasCompletedAssistantReply(in: messages) {
+                await finalizeFromMessages(messages)
+            }
+            clearActiveRunID()
+        default:
+            // Unknown/failed status — clear the stale run_id.
+            clearActiveRunID()
+            awaitingResult = false
+        }
+    }
+
     private func process(_ event: HermesStreamEvent) async {
         switch event {
         case .assistantDelta(let msgID, let text):
@@ -411,10 +852,12 @@ final class ChatStore {
         // or the partial reply (which lives only in ephemeral streaming state until
         // a completion event) disappears instead of freezing in place.
         commitPartialResponseOnStop()
+        pendingApproval = nil
         working = false
         reconnecting = false
         recovering = false
         awaitingResult = false
+        clearActiveRunID()
         rebuildTurns()
         if let runID = currentRunID {
             Task {
@@ -500,7 +943,7 @@ final class ChatStore {
                 shouldMarkStreamingLayoutChanged = true
             }
 
-        case .approvalRequired, .unknown:
+        case .approvalRequired, .runsApprovalRequired, .unknown:
             break
 
         case .runCompleted(let messages, let usage):
@@ -712,6 +1155,44 @@ final class ChatStore {
         streamingLayoutTick &+= 1
         guard force || streamingLayoutTick.isMultiple(of: 4) else { return }
         streamingRevision &+= 1
+        // Throttle-persist the in-flight partial so a crash mid-stream
+        // preserves progress. Only writes the last-turn partial, not the full
+        // timeline, so the write is cheap. Skipped when no repository is set.
+        partialPersistTick &+= 1
+        if partialPersistTick.isMultiple(of: Self.partialPersistInterval) {
+            persistInFlightPartialIfNeeded()
+        }
+    }
+
+    /// Persists the streaming partial for the current in-flight turn (the last
+    /// assistant message in the live timeline). Cheap: only writes one message.
+    private func persistInFlightPartialIfNeeded() {
+        guard let repository, working else { return }
+        let content = activeStreamingText
+        let reasoning = activeStreamingThinking
+        guard content?.isEmpty == false || reasoning?.isEmpty == false else { return }
+
+        // Reuse a stable local id across ticks so each write UPDATES one row rather
+        // than inserting a new progressively-longer partial every ~224ms.
+        let partialID = currentPartialLocalID ?? UUID()
+        currentPartialLocalID = partialID
+
+        // Build a synthetic in-flight message mirroring streamingFallbackMessage().
+        let partial = TimelineMessage(storedLocalID: partialID, message: HermesMessage(
+            id: nil,
+            sessionId: sessionID,
+            role: "assistant",
+            content: content,
+            toolCalls: nil,
+            toolCallId: nil,
+            toolName: nil,
+            timestamp: Date.now.timeIntervalSince1970,
+            finishReason: nil,      // nil = incomplete / partial
+            reasoning: reasoning,
+            reasoningContent: reasoning
+        ))
+        // orderIndex = number of messages so far (approximate; corrected on finalize).
+        repository.upsertPartial(partial, sessionID: sessionID, profileID: profileID, orderIndex: timeline.count)
     }
 
     // MARK: - Reconcile on runCompleted
@@ -795,6 +1276,8 @@ final class ChatStore {
         liveBlocks.removeAll()
         currentStreamMsgID = nil
         rebuildTurns()
+        // Persist the finalized timeline after a successful run.
+        repository?.upsertMessages(timeline, sessionID: sessionID, profileID: profileID)
         onRunCompleted(sessionID)
     }
 
@@ -826,6 +1309,8 @@ final class ChatStore {
         liveBlocks.removeAll()
         liveTools.removeAll()
         currentStreamMsgID = nil
+        // Persist the stopped partial so it survives the next cold launch.
+        repository?.upsertMessages(timeline, sessionID: sessionID, profileID: profileID)
     }
 
     /// Appends a failed run as an assistant error bubble so it's visible inline in
@@ -885,6 +1370,8 @@ final class ChatStore {
               !hasAssistantAfterLastUser
         else { return }
         upsertAssistantAfterLastUser(fallback)
+        // Persist the partial so it survives a crash or connection drop.
+        repository?.upsertMessages(timeline, sessionID: sessionID, profileID: profileID)
     }
 
     private func streamingFallbackMessage() -> HermesMessage? {
@@ -1043,8 +1530,13 @@ final class ChatStore {
         guard awaitingResult, !recovering else { return }
         recoveryTask?.cancel()
         recoveryTask = Task { [weak self] in
-            await self?.recoverInterruptedRun()
-            self?.recoveryTask = nil
+            guard let self else { return }
+            if self.useRunsAPI, let runID = self.currentRunID {
+                await self.recoverInterruptedRunsRun(runID: runID)
+            } else {
+                await self.recoverInterruptedRun()
+            }
+            self.recoveryTask = nil
         }
     }
 
@@ -1053,6 +1545,12 @@ final class ChatStore {
     /// stream, so adopt it as recoverable work and poll for the final transcript.
     private func adoptExternalRunIfNeeded(from messages: [HermesMessage]) {
         guard !working, !awaitingResult, hasPendingAssistantReply(in: messages) else { return }
+        // Only adopt a run that could plausibly still be in flight. A conversation
+        // that simply *ends* on a user message — an aborted/failed turn, or one whose
+        // reply never persisted — must NOT trigger recovery, or opening that chat
+        // spins "reconnecting" for the whole recovery window, every single time. The
+        // trailing user message being recent is our only signal a run is live.
+        guard lastUserMessageIsRecent(in: messages) else { return }
 
         awaitingResult = true
         receivedRunCompleted = false
@@ -1060,6 +1558,15 @@ final class ChatStore {
         currentRunID = nil
         lastError = nil
         recoverIfNeeded()
+    }
+
+    /// True when the conversation's last user message is recent enough that a run
+    /// started for it could still be running server-side. Beyond the recovery
+    /// window, an unanswered user message is a dead turn, not a live one.
+    private func lastUserMessageIsRecent(in messages: [HermesMessage]) -> Bool {
+        guard let lastUser = messages.last(where: { $0.role == "user" }),
+              let timestamp = lastUser.timestamp else { return false }
+        return Date.now.timeIntervalSince1970 - timestamp < Self.recoveryWindow
     }
 
     /// Recovers a turn whose live stream dropped before completing (app suspended,
@@ -1092,12 +1599,13 @@ final class ChatStore {
             delay = min(delay * 2, .seconds(8))
         }
 
-        // Gave up actively polling. The turn stays recoverable (reopening or
-        // foregrounding the chat retries via `recoverIfNeeded()`); stop the spinner
-        // and leave a gentle, non-fatal note rather than a scary timeout error.
+        // Gave up actively polling. Don't pop a blocking alert telling the user to
+        // leave and come back — that's jarring UX. Just stop the spinner; the turn
+        // shows its inline "No response recorded" note, and recovery quietly retries
+        // when the chat reappears or the app foregrounds (recoverIfNeeded). It stays
+        // marked recoverable so a later poll can still spawn the reply inline.
         guard !receivedRunCompleted else { return }
         working = false
-        lastError = .network("Lost the connection while the agent was still responding. Reopen the chat to load the finished reply.")
         rebuildTurns()
     }
 
@@ -1120,7 +1628,10 @@ final class ChatStore {
         }
         let start = messages.index(after: lastUserIdx)
         guard start < messages.endIndex else { return true }
-        return !messages[start...].contains { $0.role == "assistant" && $0.hasVisibleContent }
+        // Completion is atomic — the whole transcript lands at once — so *any*
+        // assistant message after the user (even a tool-only one with no visible
+        // text) means the run finished. Only a bare trailing user message is pending.
+        return !messages[start...].contains { $0.role == "assistant" }
     }
 
     /// Finalizes the in-flight turn from the authoritative `/messages` list.
@@ -1153,6 +1664,8 @@ final class ChatStore {
         liveBlocks.removeAll()
         currentStreamMsgID = nil
         rebuildTurns()
+        // Persist the recovered timeline.
+        repository?.upsertMessages(timeline, sessionID: sessionID, profileID: profileID)
         onRunCompleted(sessionID)
     }
 }
@@ -1162,7 +1675,7 @@ private extension HermesStreamEvent {
         switch self {
         case .toolStarted, .toolCompleted:
             return true
-        case .runStarted, .messageStarted, .assistantDelta, .assistantCompleted, .thinkingDelta, .toolProgress, .approvalRequired, .runCompleted, .runFailed, .unknown:
+        case .runStarted, .messageStarted, .assistantDelta, .assistantCompleted, .thinkingDelta, .toolProgress, .approvalRequired, .runsApprovalRequired, .runCompleted, .runFailed, .unknown:
             return false
         }
     }
@@ -1185,3 +1698,122 @@ private extension HermesMessage {
         || reasoningContent?.isEmpty == false
     }
 }
+
+#if DEBUG
+// MARK: - Debug harness hooks
+//
+// Backend-free seams so the timeline (scrolling, windowing, vanishing-on-append)
+// can be exercised in the running simulator without a live Hermes server. Lives
+// in this file so it can reach `rebuildTurns()` and the private streaming state.
+// Compiled out of release builds.
+extension ChatStore {
+    /// Replaces the timeline with `count` synthetic user/assistant turns and
+    /// rebuilds, so the view opens on a long conversation pinned to the bottom.
+    func debugSeedLongChat(turnCount count: Int) {
+        var messages: [TimelineMessage] = []
+        let base = Date.now.timeIntervalSince1970 - Double(count) * 120
+        for i in 0..<count {
+            let t = base + Double(i) * 120
+            messages.append(TimelineMessage(message: HermesMessage(
+                id: i * 2, sessionId: sessionID, role: "user",
+                content: "Turn \(i + 1): what's the status on item #\(i + 1)? Give me the short version.",
+                toolCalls: nil, toolCallId: nil, toolName: nil,
+                timestamp: t, finishReason: nil, reasoning: nil, reasoningContent: nil
+            )))
+            // Every 5th reply gets rich markdown (table, nested list, code, inline
+            // styles) so the markdown renderer can be eyeballed in the harness.
+            let content: String
+            if i % 5 == 4 {
+                content = """
+                Reply \(i + 1). Here's a **richer** rundown with _formatting_ and ~~edits~~.
+
+                | Metric | Value | Trend |
+                | --- | ---: | :---: |
+                | Latency | 142ms | ↓ |
+                | Errors | 3 | → |
+
+                1. First step with `inline code`
+                   - nested detail A
+                   - nested detail B
+                2. Second step → see [the docs](https://example.com)
+
+                ```swift
+                let x = items.filter { $0.isReady }
+                ```
+
+                > A blockquote to round it out.
+                """
+            } else {
+                content = """
+                Reply \(i + 1). Item #\(i + 1) is on track.
+
+                - First point about item \(i + 1).
+                - Second point with a bit more detail so the bubble has real height.
+                - Third point to round it out.
+                """
+            }
+            messages.append(TimelineMessage(message: HermesMessage(
+                id: i * 2 + 1, sessionId: sessionID, role: "assistant",
+                content: content,
+                toolCalls: nil, toolCallId: nil, toolName: nil,
+                timestamp: t + 30, finishReason: "stop", reasoning: nil, reasoningContent: nil
+            )))
+
+            // Every 7th turn: a tool call that hit the approval gate, so the
+            // pending-approval surfacing can be eyeballed in the harness.
+            if i % 7 == 6 {
+                let callID = "call-approval-\(i)"
+                messages.append(TimelineMessage(message: HermesMessage(
+                    id: nil, sessionId: sessionID, role: "assistant", content: nil,
+                    toolCalls: [WireToolCall(id: callID, callId: callID, type: "function",
+                        function: .init(name: "terminal", arguments: "{\"command\":\"chmod 777 /tmp/probe\"}"))],
+                    toolCallId: nil, toolName: nil,
+                    timestamp: t + 40, finishReason: "tool_calls", reasoning: nil, reasoningContent: nil
+                )))
+                messages.append(TimelineMessage(message: HermesMessage(
+                    id: nil, sessionId: sessionID, role: "tool",
+                    content: "{\"output\":\"\",\"exit_code\":-1,\"status\":\"pending_approval\",\"approval_pending\":true,\"command\":\"chmod 777 /tmp/probe\",\"description\":\"world/other-writable permissions\"}",
+                    toolCalls: nil, toolCallId: callID, toolName: "terminal",
+                    timestamp: t + 41, finishReason: nil, reasoning: nil, reasoningContent: nil
+                )))
+            }
+        }
+        timeline = messages
+        loading = false
+        debugRebuildTurns()
+    }
+
+    /// Simulates a send: appends a user turn with `working = true` (the exact moment
+    /// the vanishing bug struck), then lands an assistant reply a beat later — no
+    /// network involved. Tap the harness button after scrolling up to test the snap.
+    func debugSimulateSend() {
+        let n = timeline.lazy.filter { $0.message.role == "user" }.count + 1
+        timeline.append(TimelineMessage(message: HermesMessage(
+            id: nil, sessionId: sessionID, role: "user",
+            content: "Debug send #\(n) — this message must stay visible after sending.",
+            toolCalls: nil, toolCallId: nil, toolName: nil,
+            timestamp: Date.now.timeIntervalSince1970, finishReason: nil,
+            reasoning: nil, reasoningContent: nil
+        )))
+        working = true
+        debugRebuildTurns()
+
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1))
+            timeline.append(TimelineMessage(message: HermesMessage(
+                id: nil, sessionId: sessionID, role: "assistant",
+                content: "Reply to debug send #\(n). If you can read this and the message above, the turn did not vanish.",
+                toolCalls: nil, toolCallId: nil, toolName: nil,
+                timestamp: Date.now.timeIntervalSince1970, finishReason: "stop",
+                reasoning: nil, reasoningContent: nil
+            )))
+            working = false
+            debugRebuildTurns()
+        }
+    }
+
+    /// Private `rebuildTurns()` is reachable here (same file); expose it under a
+    /// debug name for the harness hooks above.
+    private func debugRebuildTurns() { rebuildTurns() }
+}
+#endif
