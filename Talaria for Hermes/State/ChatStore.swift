@@ -134,6 +134,18 @@ final class ChatStore {
     /// concurrent turns can't clobber each other's global model. See `ModelGate`.
     private let modelGate: ModelGate?
 
+    /// Optional SwiftData repository for local-first persistence and CloudKit sync.
+    /// nil in the DEBUG harness (no container there) and guards all write paths.
+    private let repository: ChatRepository?
+    /// The profile this session belongs to, used to scope SwiftData queries.
+    private let profileID: String
+
+    /// How often (in streaming revision ticks) to checkpoint the in-flight partial
+    /// to SwiftData. Every 16 ticks ≈ every ~16×14ms ≈ ~224ms — cheap enough not
+    /// to block the UI but frequent enough to capture meaningful progress on a drop.
+    private static let partialPersistInterval = 16
+    private var partialPersistTick = 0
+
     /// Model used for each completed turn, keyed by the turn's order index. Kept
     /// here (not on the wire message, which has no model field) so labels stay
     /// correct across the per-turn timeline rebuilds that `runCompleted` triggers.
@@ -144,6 +156,8 @@ final class ChatStore {
     init(
         client: HermesClient,
         sessionID: String,
+        profileID: String = "",
+        repository: ChatRepository? = nil,
         onRunCompleted: @escaping @MainActor @Sendable (String) -> Void = { _ in },
         onTurnStart: (@MainActor @Sendable () async -> String?)? = nil,
         persistTurnModel: (@MainActor @Sendable (Int, String) -> Void)? = nil,
@@ -152,11 +166,23 @@ final class ChatStore {
     ) {
         self.client = client
         self.sessionID = sessionID
+        self.profileID = profileID
+        self.repository = repository
         self.onRunCompleted = onRunCompleted
         self.onTurnStart = onTurnStart
         self.persistTurnModel = persistTurnModel
         self.turnModelForIndex = turnModelForIndex
         self.modelGate = modelGate
+
+        // Load local timeline immediately so the chat shows prior content
+        // before the network fetch returns. Repository is nil in debug harness.
+        if let repository {
+            let local = repository.messages(sessionID: sessionID, profileID: profileID)
+            if !local.isEmpty {
+                self.timeline = local
+                rebuildTurns()
+            }
+        }
     }
 
     // MARK: - Loading
@@ -167,9 +193,14 @@ final class ChatStore {
         defer { loading = false }
         do {
             let messages = try await client.messages(sessionID: sessionID)
-            timeline = messages.map { TimelineMessage(message: $0) }
+            let serverTimeline = messages.map { TimelineMessage(message: $0) }
+            // Merge: local may have a partial assistant reply the server doesn't;
+            // keep it unless the server has a complete reply for that turn.
+            timeline = mergeServer(serverTimeline, withLocal: timeline)
             rebuildTurns()
             adoptExternalRunIfNeeded(from: messages)
+            // Persist the merged truth so the next cold launch is instant.
+            repository?.upsertMessages(timeline, sessionID: sessionID, profileID: profileID)
         } catch {
             let mapped = HermesError(error)
             // Cancellation is routine (view churn / navigation); never surface it to the user.
@@ -248,6 +279,10 @@ final class ChatStore {
 
         let agentText = ([text] + fileRefs).filter { !$0.isEmpty }.joined(separator: "\n\n")
         let input = HermesChatInput.make(text: agentText, attachments: attachments)
+
+        // Persist the user message immediately so it survives a crash before the
+        // server acknowledges it. The assistant partial will follow from streaming.
+        repository?.upsertMessages(timeline, sessionID: sessionID, profileID: profileID)
 
         recoveryTask?.cancel()
         recoveryTask = nil
@@ -712,6 +747,39 @@ final class ChatStore {
         streamingLayoutTick &+= 1
         guard force || streamingLayoutTick.isMultiple(of: 4) else { return }
         streamingRevision &+= 1
+        // Throttle-persist the in-flight partial so a crash mid-stream
+        // preserves progress. Only writes the last-turn partial, not the full
+        // timeline, so the write is cheap. Skipped when no repository is set.
+        partialPersistTick &+= 1
+        if partialPersistTick.isMultiple(of: Self.partialPersistInterval) {
+            persistInFlightPartialIfNeeded()
+        }
+    }
+
+    /// Persists the streaming partial for the current in-flight turn (the last
+    /// assistant message in the live timeline). Cheap: only writes one message.
+    private func persistInFlightPartialIfNeeded() {
+        guard let repository, working else { return }
+        let content = activeStreamingText
+        let reasoning = activeStreamingThinking
+        guard content?.isEmpty == false || reasoning?.isEmpty == false else { return }
+
+        // Build a synthetic in-flight message mirroring streamingFallbackMessage().
+        let partial = TimelineMessage(message: HermesMessage(
+            id: nil,
+            sessionId: sessionID,
+            role: "assistant",
+            content: content,
+            toolCalls: nil,
+            toolCallId: nil,
+            toolName: nil,
+            timestamp: Date.now.timeIntervalSince1970,
+            finishReason: nil,      // nil = incomplete / partial
+            reasoning: reasoning,
+            reasoningContent: reasoning
+        ))
+        // orderIndex = number of messages so far (approximate; corrected on finalize).
+        repository.upsertPartial(partial, sessionID: sessionID, profileID: profileID, orderIndex: timeline.count)
     }
 
     // MARK: - Reconcile on runCompleted
@@ -795,6 +863,8 @@ final class ChatStore {
         liveBlocks.removeAll()
         currentStreamMsgID = nil
         rebuildTurns()
+        // Persist the finalized timeline after a successful run.
+        repository?.upsertMessages(timeline, sessionID: sessionID, profileID: profileID)
         onRunCompleted(sessionID)
     }
 
@@ -826,6 +896,8 @@ final class ChatStore {
         liveBlocks.removeAll()
         liveTools.removeAll()
         currentStreamMsgID = nil
+        // Persist the stopped partial so it survives the next cold launch.
+        repository?.upsertMessages(timeline, sessionID: sessionID, profileID: profileID)
     }
 
     /// Appends a failed run as an assistant error bubble so it's visible inline in
@@ -885,6 +957,8 @@ final class ChatStore {
               !hasAssistantAfterLastUser
         else { return }
         upsertAssistantAfterLastUser(fallback)
+        // Persist the partial so it survives a crash or connection drop.
+        repository?.upsertMessages(timeline, sessionID: sessionID, profileID: profileID)
     }
 
     private func streamingFallbackMessage() -> HermesMessage? {
@@ -1171,6 +1245,8 @@ final class ChatStore {
         liveBlocks.removeAll()
         currentStreamMsgID = nil
         rebuildTurns()
+        // Persist the recovered timeline.
+        repository?.upsertMessages(timeline, sessionID: sessionID, profileID: profileID)
         onRunCompleted(sessionID)
     }
 }

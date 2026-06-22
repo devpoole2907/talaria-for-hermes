@@ -1,4 +1,5 @@
 import SwiftUI
+import SwiftData
 
 @main
 struct TalariaApp: App {
@@ -6,7 +7,15 @@ struct TalariaApp: App {
 
     var body: some Scene {
         WindowGroup {
-            RootView()
+            RootView(repository: Self.makeRepository())
         }
+    }
+
+    /// Builds the ChatRepository backed by the shared PersistenceController.
+    /// Returns nil if the container is unexpectedly unavailable (should not happen
+    /// after PersistenceController's self-healing init, but guards defensively).
+    @MainActor
+    private static func makeRepository() -> ChatRepository {
+        ChatRepository(container: PersistenceController.shared.container)
     }
 }

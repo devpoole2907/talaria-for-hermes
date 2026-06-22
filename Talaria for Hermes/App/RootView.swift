@@ -8,7 +8,12 @@ struct RootView: View {
     @State private var isInWelcomeFlow: Bool
     @State private var setupTarget: SetupTarget?
 
-    init() {
+    /// Shared persistence repository, injected from TalariaApp so the same
+    /// ModelContainer is used across the whole app lifecycle.
+    private let repository: ChatRepository
+
+    init(repository: ChatRepository) {
+        self.repository = repository
         let preferences = AppPreferences()
         let profileStore = ServerProfileStore()
         _preferences = State(initialValue: preferences)
@@ -27,7 +32,7 @@ struct RootView: View {
             active = profiles.first
         }
         if let active {
-            _appModel = State(initialValue: AppModel(profile: active, preferences: preferences, profileStore: profileStore))
+            _appModel = State(initialValue: AppModel(profile: active, preferences: preferences, profileStore: profileStore, repository: repository))
             _configuredProfile = State(initialValue: active)
             _isInWelcomeFlow = State(initialValue: false)
         } else {
@@ -94,7 +99,7 @@ struct RootView: View {
     private func completeSetup(_ profile: ServerProfile) throws {
         try profileStore.save(profile)
         preferences.activeProfileID = profile.id
-        let model = AppModel(profile: profile, preferences: preferences, profileStore: profileStore)
+        let model = AppModel(profile: profile, preferences: preferences, profileStore: profileStore, repository: repository)
         withAnimation {
             configuredProfile = profile
             appModel = model
@@ -107,7 +112,7 @@ struct RootView: View {
     private func completeDashboardSetup(_ profile: ServerProfile) throws {
         try profileStore.save(profile)
         preferences.activeProfileID = profile.id
-        let model = AppModel(profile: profile, preferences: preferences, profileStore: profileStore)
+        let model = AppModel(profile: profile, preferences: preferences, profileStore: profileStore, repository: repository)
         withAnimation {
             configuredProfile = profile
             appModel = model
