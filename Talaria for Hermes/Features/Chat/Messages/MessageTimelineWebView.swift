@@ -36,6 +36,13 @@ struct MessageTimelineWebView: View {
             } else {
                 WebView(page)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    #if canImport(UIKit)
+                    // The SwiftUI WebView owns its own scroll view, which
+                    // `.scrollDismissesKeyboard` can't reach — so the swipe-to-dismiss
+                    // gesture stopped working when the timeline became a WebView. Reach
+                    // the underlying WKWebView's scroll view and restore it natively.
+                    .background(WebKeyboardDismissConfigurator())
+                    #endif
                     .task { await sync() }
                     .onChange(of: store.turns.count) { Task { await sync() } }
                     .onChange(of: store.streamingRevision) { Task { await sync() } }
@@ -637,6 +644,52 @@ struct MessageTimelineWebView: View {
         """
     }
 }
+
+#if canImport(UIKit)
+/// Restores swipe-to-dismiss-keyboard for the timeline WebView. The iOS 26 SwiftUI
+/// `WebView` doesn't surface its scroll view to `.scrollDismissesKeyboard`, so we
+/// reach the nearest `WKWebView`'s `scrollView` from a zero-size probe placed in
+/// the WebView's background and set `keyboardDismissMode = .interactive` (drag the
+/// keyboard down as you scroll the history, like Messages). Idempotent and re-applied
+/// on every view update, so it catches the scroll view once WebKit has built it.
+private struct WebKeyboardDismissConfigurator: UIViewRepresentable {
+    func makeUIView(context: Context) -> UIView {
+        let probe = UIView(frame: .zero)
+        probe.isUserInteractionEnabled = false
+        probe.isHidden = true
+        return probe
+    }
+
+    func updateUIView(_ probe: UIView, context: Context) {
+        // Defer so the WKWebView is in the hierarchy when we search.
+        DispatchQueue.main.async {
+            guard let scrollView = Self.nearestWebScrollView(from: probe) else { return }
+            if scrollView.keyboardDismissMode != .interactive {
+                scrollView.keyboardDismissMode = .interactive
+            }
+        }
+    }
+
+    /// Walks outward from the probe; the first ancestor subtree containing a
+    /// `WKWebView` is the timeline's own web view (avoids grabbing an unrelated one).
+    private static func nearestWebScrollView(from probe: UIView) -> UIScrollView? {
+        var ancestor: UIView? = probe.superview
+        while let current = ancestor {
+            if let scrollView = descendantWebScrollView(in: current) { return scrollView }
+            ancestor = current.superview
+        }
+        return nil
+    }
+
+    private static func descendantWebScrollView(in view: UIView) -> UIScrollView? {
+        if let web = view as? WKWebView { return web.scrollView }
+        for sub in view.subviews {
+            if let found = descendantWebScrollView(in: sub) { return found }
+        }
+        return nil
+    }
+}
+#endif
 
 private struct WebTimelineEmptyState: View {
     var body: some View {
