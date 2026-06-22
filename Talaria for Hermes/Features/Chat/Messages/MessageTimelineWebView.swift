@@ -132,9 +132,22 @@ struct MessageTimelineWebView: View {
             }
         }
         parts.append(turn.assistantModelID ?? "")
-        parts.append(turn.streamingThinking ?? "")
+        parts.append(reasoningText(turn) ?? "")
         if isLast { parts.append("w:\(store.working):\(store.reconnecting)") }
         return parts.joined(separator: "|")
+    }
+
+    /// Reasoning to show for a turn: the live stream while working, else the persisted
+    /// reasoning from the turn's assistant messages (so reloading a chat keeps the
+    /// reasoning section and a reasoning-only reply never renders blank).
+    private func reasoningText(_ turn: ChatTurn) -> String? {
+        if let live = turn.streamingThinking, !live.isEmpty { return live }
+        for message in turn.assistantMessages {
+            if let r = message.message.reasoning ?? message.message.reasoningContent, !r.isEmpty {
+                return r
+            }
+        }
+        return nil
     }
 
     private func turnHTML(_ turn: ChatTurn, isLast: Bool) -> String {
@@ -171,12 +184,12 @@ struct MessageTimelineWebView: View {
     }
 
     private func assistantHTML(_ turn: ChatTurn) -> String {
-        let hasThinking = turn.streamingThinking?.isEmpty == false
-        guard !turn.blocks.isEmpty || hasThinking else { return "" }
+        let reasoning = reasoningText(turn)
+        guard !turn.blocks.isEmpty || reasoning != nil else { return "" }
 
         var html = "<div class=\"assistant\">"
-        if let thinking = turn.streamingThinking, !thinking.isEmpty {
-            html += reasoningHTML(thinking)
+        if let reasoning {
+            html += reasoningHTML(reasoning)
         }
         for block in turn.blocks {
             switch block {

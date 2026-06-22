@@ -1,5 +1,6 @@
 import PhotosUI
 import SwiftUI
+import UIKit
 
 struct ChatView: View {
     let session: Session
@@ -11,6 +12,7 @@ struct ChatView: View {
     @State private var store: ChatStore?
     @State private var showRename: Bool = false
     @State private var showModelPicker: Bool = false
+    @State private var showDebugInfo: Bool = false
     @State private var renameText: String = ""
     @State private var draftText: String = ""
     @State private var errorMessage: String?
@@ -50,10 +52,17 @@ struct ChatView: View {
                 isPinned: isPinned,
                 showRenameAlert: $showRename,
                 showModelPicker: $showModelPicker,
+                showDebugInfo: $showDebugInfo,
                 onCreateSession: createSession,
                 onTogglePinned: togglePinned,
                 onShowTools: onShowTools
             )
+        }
+        .alert("Debug Info", isPresented: $showDebugInfo) {
+            Button("Copy") { UIPasteboard.general.string = debugInfoText }
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(debugInfoText)
         }
         .alert("Rename Session", isPresented: $showRename) {
             TextField("Name", text: $renameText)
@@ -186,6 +195,36 @@ struct ChatView: View {
 
     private var currentSession: Session {
         appModel.sessionStore.session(id: session.id) ?? session
+    }
+
+    /// Human-readable debug snapshot for the Info alert. Surfaces the session id plus
+    /// the local vs. server message picture (useful when an agent reply is missing on
+    /// load) and the run/connection state.
+    private var debugInfoText: String {
+        let s = currentSession
+        let messages = store?.timeline ?? []
+        let assistantCount = messages.filter { $0.message.role == "assistant" }.count
+        let userCount = messages.filter { $0.message.role == "user" }.count
+        let lastRole = messages.last?.message.role ?? "—"
+
+        var lines: [String] = []
+        lines.append("Session ID: \(s.id)")
+        lines.append("Title: \(s.title ?? "—")")
+        lines.append("Source: \(s.source ?? "—")")
+        lines.append("Model: \(appModel.sessionModelID(for: s.id))")
+        if let parent = s.parentSessionId { lines.append("Parent: \(parent)") }
+        lines.append("Server messages: \(s.messageCount.map(String.init) ?? "—")")
+        lines.append("Loaded messages: \(messages.count) (user \(userCount) / assistant \(assistantCount))")
+        lines.append("Turns: \(store?.turns.count ?? 0)")
+        lines.append("Last message role: \(lastRole)")
+        lines.append("Run ID: \(store?.currentRunID ?? "—")")
+        lines.append("State: working=\(store?.working ?? false) reconnecting=\(store?.reconnecting ?? false) loading=\(store?.loading ?? false)")
+        if let usage = store?.lastUsage {
+            lines.append("Last usage: in \(usage.input ?? 0) / out \(usage.output ?? 0)")
+        }
+        lines.append("Session streaming: \(appModel.useSessionStream)")
+        lines.append("Server: \(appModel.activeProfile.name) — \(appModel.activeProfile.url.absoluteString)")
+        return lines.joined(separator: "\n")
     }
 
     @Sendable
