@@ -1352,6 +1352,25 @@ extension ChatStore {
                 toolCalls: nil, toolCallId: nil, toolName: nil,
                 timestamp: t + 30, finishReason: "stop", reasoning: nil, reasoningContent: nil
             )))
+
+            // Every 7th turn: a tool call that hit the approval gate, so the
+            // pending-approval surfacing can be eyeballed in the harness.
+            if i % 7 == 6 {
+                let callID = "call-approval-\(i)"
+                messages.append(TimelineMessage(message: HermesMessage(
+                    id: nil, sessionId: sessionID, role: "assistant", content: nil,
+                    toolCalls: [WireToolCall(id: callID, callId: callID, type: "function",
+                        function: .init(name: "terminal", arguments: "{\"command\":\"chmod 777 /tmp/probe\"}"))],
+                    toolCallId: nil, toolName: nil,
+                    timestamp: t + 40, finishReason: "tool_calls", reasoning: nil, reasoningContent: nil
+                )))
+                messages.append(TimelineMessage(message: HermesMessage(
+                    id: nil, sessionId: sessionID, role: "tool",
+                    content: "{\"output\":\"\",\"exit_code\":-1,\"status\":\"pending_approval\",\"approval_pending\":true,\"command\":\"chmod 777 /tmp/probe\",\"description\":\"world/other-writable permissions\"}",
+                    toolCalls: nil, toolCallId: callID, toolName: "terminal",
+                    timestamp: t + 41, finishReason: nil, reasoning: nil, reasoningContent: nil
+                )))
+            }
         }
         timeline = messages
         loading = false

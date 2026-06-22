@@ -239,18 +239,38 @@ struct MessageTimelineWebView: View {
     }
 
     private func toolHTML(_ entry: ChatTurn.ToolEntry) -> String {
-        let status = entry.isRunning ? "running" : "done"
+        // Hermes gates dangerous commands: the tool *result* carries
+        // `approval_pending: true` (the run finishes without executing — there's no
+        // separate approval SSE event, and session-stream runs aren't approvable via
+        // the Runs API). So surface it inline as a distinct "Approval required" state
+        // with the command + reason, instead of a silent completed tool.
+        let approval = entry.output.flatMap(approvalInfo(from:))
+
+        let stateClass = approval != nil ? "approval" : (entry.isRunning ? "running" : "done")
         let name = MarkdownHTMLRenderer.escape(ToolCallFormatting.displayName(entry.name))
-        let badge = "<span class=\"tool-badge \(status)\">\(Self.wrenchSVG)</span>"
-        let pill: String = entry.isRunning
-            ? "<span class=\"tool-pill running\"><span class=\"spinner sm\"></span>Running</span>"
-            : "<span class=\"tool-pill done\">\(Self.checkSVG)Done</span>"
+        let badge = "<span class=\"tool-badge \(stateClass)\">\(approval != nil ? Self.warnSVG : Self.wrenchSVG)</span>"
+        let pill: String
+        if approval != nil {
+            pill = "<span class=\"tool-pill approval\">\(Self.warnSVG)Approval required</span>"
+        } else if entry.isRunning {
+            pill = "<span class=\"tool-pill running\"><span class=\"spinner sm\"></span>Running</span>"
+        } else {
+            pill = "<span class=\"tool-pill done\">\(Self.checkSVG)Done</span>"
+        }
 
         var detail = ""
+        if let approval {
+            let cmd = MarkdownHTMLRenderer.escape(approval.command)
+            let reason = MarkdownHTMLRenderer.escape(approval.description)
+            detail += "<div class=\"tool-section\"><div class=\"approval-note\">Blocked pending approval — approve it on the machine running Hermes for the command to execute.</div>"
+            if !cmd.isEmpty { detail += "<pre class=\"tool-block\">\(cmd)</pre>" }
+            if !reason.isEmpty { detail += "<div class=\"approval-reason\">Reason: \(reason)</div>" }
+            detail += "</div>"
+        }
         if let args = entry.arguments, !args.isEmpty {
             detail += "<div class=\"tool-section\"><div class=\"tool-label\">Input</div><pre class=\"tool-block\">\(MarkdownHTMLRenderer.escape(args))</pre></div>"
         }
-        if let output = entry.output, !output.isEmpty {
+        if approval == nil, let output = entry.output, !output.isEmpty {
             let clean = ToolCallFormatting.cleanOutput(output)
             detail += "<div class=\"tool-section\"><div class=\"tool-label\">Output</div><pre class=\"tool-block\">\(MarkdownHTMLRenderer.escape(clean))</pre></div>"
         } else if let progress = entry.progress?.trimmingCharacters(in: .whitespacesAndNewlines), !progress.isEmpty {
@@ -258,13 +278,32 @@ struct MessageTimelineWebView: View {
         }
 
         if detail.isEmpty {
-            return "<div class=\"tool \(status)\"><div class=\"tool-head\">\(badge)<span class=\"tool-name\">\(name)</span>\(pill)</div></div>"
+            return "<div class=\"tool \(stateClass)\"><div class=\"tool-head\">\(badge)<span class=\"tool-name\">\(name)</span>\(pill)</div></div>"
         }
+        // Auto-expand the approval case so the user sees the blocked command immediately.
+        let openClass = approval != nil ? " open" : ""
         return """
-        <div class="tool \(status) collapsible"><div class="tool-head" onclick="toggleCollapsible(this)">\
+        <div class="tool \(stateClass) collapsible\(openClass)"><div class="tool-head" onclick="toggleCollapsible(this)">\
         \(badge)<span class="tool-name">\(name)</span>\(pill)\(Self.chevSVG)</div>\
         <div class="collapse"><div class="collapse-inner"><div class="tool-detail">\(detail)</div></div></div></div>
         """
+    }
+
+    private struct ApprovalInfo { let command: String; let description: String }
+
+    /// Parses a terminal tool result for Hermes's pending-approval marker. Returns the
+    /// command + risk description when the result is `approval_pending`, else nil.
+    private func approvalInfo(from output: String) -> ApprovalInfo? {
+        guard output.contains("approval_pending") || output.contains("pending_approval"),
+              let data = output.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        let pending = (obj["approval_pending"] as? Bool == true) || (obj["status"] as? String == "pending_approval")
+        guard pending else { return nil }
+        return ApprovalInfo(
+            command: (obj["command"] as? String) ?? "",
+            description: (obj["description"] as? String) ?? (obj["pattern_key"] as? String) ?? ""
+        )
     }
 
     private func indicatorHTML(_ turn: ChatTurn, isLast: Bool) -> String {
@@ -352,6 +391,7 @@ struct MessageTimelineWebView: View {
           --hairline: color-mix(in srgb, CanvasText 14%, transparent);
           --running: light-dark(#007aff, #0a84ff);
           --done: light-dark(#34c759, #30d158);
+          --approval: light-dark(#ff9500, #ff9f0a);
         }
         * { box-sizing: border-box; -webkit-text-size-adjust: 100%; }
         html, body { margin: 0; padding: 0; }
@@ -484,6 +524,13 @@ struct MessageTimelineWebView: View {
         @keyframes shimmer { to { background-position: -200% 0; } }
         .no-response { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--tertiary); font-style: italic; }
         .no-response .ic { width: 14px; height: 14px; }
+        /* Approval-required tool state (amber) */
+        .tool.approval { border-left-color: var(--approval); }
+        .tool-badge.approval { color: var(--approval); background: color-mix(in srgb, var(--approval) 14%, transparent); border-color: color-mix(in srgb, var(--approval) 24%, transparent); }
+        .tool-pill.approval { color: var(--approval); background: color-mix(in srgb, var(--approval) 14%, transparent); }
+        .tool-pill.approval .ic { width: 13px; height: 13px; }
+        .approval-note { font-size: 13px; color: CanvasText; margin-bottom: 6px; }
+        .approval-reason { font-size: 12px; color: var(--secondary); margin-top: 6px; }
 
         /* Jump to latest */
         #jump {
