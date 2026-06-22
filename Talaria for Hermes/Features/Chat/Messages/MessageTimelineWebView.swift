@@ -158,7 +158,7 @@ struct MessageTimelineWebView: View {
             inner += "<div class=\"attach-file\">\(Self.docSVG) <span>\(MarkdownHTMLRenderer.escape(name))</span></div>"
         }
         if let text = msg.message.content, !text.isEmpty {
-            inner += "<div class=\"user-bubble\">\(MarkdownHTMLRenderer.html(from: text))</div>"
+            inner += mdContent(text, cls: "user-bubble")
         }
         if turn.isSending {
             inner += "<div class=\"user-meta\"><span class=\"spinner sm\"></span>Sending…</div>"
@@ -181,7 +181,7 @@ struct MessageTimelineWebView: View {
         for block in turn.blocks {
             switch block {
             case .text(_, let content, let isStreaming):
-                html += "<div class=\"md\">\(MarkdownHTMLRenderer.html(from: content))</div>"
+                html += mdContent(content, cls: "md")
                 if !isStreaming {
                     html += actionsHTML(text: content, modelID: turn.assistantModelID)
                 }
@@ -195,8 +195,9 @@ struct MessageTimelineWebView: View {
 
     private func reasoningHTML(_ text: String) -> String {
         """
-        <details class="reasoning"><summary>\(Self.brainSVG)<span>Reasoning</span>\(Self.chevSVG)</summary>\
-        <div class="reasoning-body">\(MarkdownHTMLRenderer.escape(text))</div></details>
+        <div class="reasoning collapsible"><div class="reasoning-head" onclick="toggleCollapsible(this)">\
+        \(Self.brainSVG)<span>Reasoning</span>\(Self.chevSVG)</div>\
+        <div class="collapse"><div class="collapse-inner"><div class="reasoning-body">\(MarkdownHTMLRenderer.escape(text))</div></div></div></div>
         """
     }
 
@@ -233,8 +234,9 @@ struct MessageTimelineWebView: View {
             return "<div class=\"tool \(status)\"><div class=\"tool-head\">\(badge)<span class=\"tool-name\">\(name)</span>\(pill)</div></div>"
         }
         return """
-        <details class="tool \(status)"><summary class="tool-head">\(badge)<span class="tool-name">\(name)</span>\(pill)\(Self.chevSVG)</summary>\
-        <div class="tool-detail">\(detail)</div></details>
+        <div class="tool \(status) collapsible"><div class="tool-head" onclick="toggleCollapsible(this)">\
+        \(badge)<span class="tool-name">\(name)</span>\(pill)\(Self.chevSVG)</div>\
+        <div class="collapse"><div class="collapse-inner"><div class="tool-detail">\(detail)</div></div></div></div>
         """
     }
 
@@ -269,9 +271,30 @@ struct MessageTimelineWebView: View {
     }
 
     /// Percent-encode for a single-line, JS-decodable (`decodeURIComponent`) data
-    /// attribute that preserves newlines/quotes exactly for the copy button.
+    /// attribute that preserves newlines/quotes exactly (copy button + markdown source).
     private static func percentEncode(_ text: String) -> String {
         text.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? ""
+    }
+
+    /// The vendored markdown-it library source, loaded from the bundle once. When
+    /// present, markdown (tables, nested lists, GFM, …) is rendered in the page by
+    /// markdown-it with `html: false` (raw HTML escaped, so agent output can't inject
+    /// scripts). When absent, we fall back to the compact Swift `MarkdownHTMLRenderer`.
+    private static let markdownLibrary: String? = {
+        guard let url = Bundle.main.url(forResource: "markdown-it.min", withExtension: "js"),
+              let source = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        return source
+    }()
+
+    private static var useJSMarkdown: Bool { markdownLibrary != nil }
+
+    /// A markdown content container: `data-md` (raw source, rendered by markdown-it in
+    /// the page) when the library is available, else pre-rendered HTML.
+    private func mdContent(_ text: String, cls: String) -> String {
+        if Self.useJSMarkdown {
+            return "<div class=\"\(cls)\" data-md=\"\(Self.percentEncode(text))\"></div>"
+        }
+        return "<div class=\"\(cls)\">\(MarkdownHTMLRenderer.html(from: text))</div>"
     }
 
     // Inline SVGs (currentColor) standing in for the SF Symbols used natively.
@@ -367,17 +390,29 @@ struct MessageTimelineWebView: View {
         code { font-family: ui-monospace, SFMono-Regular, monospace; font-size: .88em; background: var(--fill-strong); padding: 1px 5px; border-radius: 5px; }
         blockquote { margin: 8px 0; padding-left: 12px; border-left: 3px solid var(--quaternary); color: var(--secondary); }
         a { color: AccentColor; text-decoration: none; }
+        hr { border: 0; border-top: 1px solid var(--hairline); margin: 16px 0; }
+        .md img, .user-bubble img { max-width: 100%; border-radius: 8px; }
+        table { border-collapse: collapse; margin: 8px 0; display: block; overflow-x: auto; max-width: 100%; font-size: 15px; }
+        th, td { border: 1px solid var(--hairline); padding: 6px 10px; text-align: left; }
+        th { font-weight: 600; background: var(--fill); }
+
+        /* Collapsible (reasoning + tool calls): animated height + chevron, matching
+           the native ToolCallView spring(response: .28, dampingFraction: .86). */
+        .collapse { display: grid; grid-template-rows: 0fr; transition: grid-template-rows .3s cubic-bezier(.34, 1.08, .64, 1); }
+        .collapsible.open > .collapse { grid-template-rows: 1fr; }
+        .collapse-inner { overflow: hidden; min-height: 0; }
+        .chev { transition: transform .3s cubic-bezier(.34, 1.08, .64, 1); }
+        .collapsible.open > .tool-head .chev,
+        .collapsible.open > .reasoning-head .chev { transform: rotate(90deg); }
 
         /* Reasoning */
-        details.reasoning { }
-        details.reasoning > summary {
-          list-style: none; display: flex; align-items: center; gap: 6px; cursor: pointer;
+        .reasoning-head {
+          display: flex; align-items: center; gap: 6px; cursor: pointer;
           font-size: 12px; font-weight: 600; color: var(--secondary); min-height: 28px;
+          -webkit-user-select: none; user-select: none;
         }
-        details.reasoning > summary::-webkit-details-marker { display: none; }
-        details.reasoning .ic { width: 15px; height: 15px; }
-        details.reasoning .chev { width: 12px; height: 12px; transition: transform .2s; margin-left: auto; }
-        details.reasoning[open] > summary .chev { transform: rotate(90deg); }
+        .reasoning-head .ic { width: 15px; height: 15px; }
+        .reasoning-head .chev { width: 12px; height: 12px; margin-left: auto; }
         .reasoning-body { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 13px; color: var(--secondary); white-space: pre-wrap; padding-top: 4px; }
 
         /* Tool calls */
@@ -386,9 +421,8 @@ struct MessageTimelineWebView: View {
           border-radius: 10px; padding: 8px 12px;
         }
         .tool.running { border-left-color: var(--running); }
-        .tool > summary, .tool-head { list-style: none; display: flex; align-items: center; gap: 8px; min-height: 28px; cursor: default; }
-        details.tool > summary { cursor: pointer; }
-        .tool > summary::-webkit-details-marker { display: none; }
+        .tool-head { display: flex; align-items: center; gap: 8px; min-height: 28px; cursor: default; -webkit-user-select: none; user-select: none; }
+        .collapsible > .tool-head { cursor: pointer; }
         .tool-badge {
           flex: 0 0 auto; width: 24px; height: 24px; border-radius: 50%;
           display: inline-flex; align-items: center; justify-content: center;
@@ -405,8 +439,7 @@ struct MessageTimelineWebView: View {
         }
         .tool-pill.running { color: var(--running); background: color-mix(in srgb, var(--running) 12%, transparent); }
         .tool-pill .ic { width: 13px; height: 13px; }
-        .tool .chev { width: 12px; height: 12px; color: var(--tertiary); transition: transform .2s; flex: 0 0 auto; }
-        details.tool[open] > summary .chev { transform: rotate(90deg); }
+        .tool .chev { width: 12px; height: 12px; color: var(--tertiary); flex: 0 0 auto; }
         .tool-detail { padding-top: 8px; }
         .tool-section + .tool-section { margin-top: 8px; }
         .tool-label { font-size: 12px; font-weight: 700; color: var(--secondary); margin-bottom: 4px; }
@@ -435,7 +468,21 @@ struct MessageTimelineWebView: View {
         <body>
         <div id="container">\(body)</div>
         <div id="jump" onclick="jumpToBottom()">↓</div>
+        \(markdownLibrary.map { "<script>\($0)</script>" } ?? "")
         <script>
+        var md = (typeof window.markdownit === 'function')
+          ? window.markdownit({ html: false, linkify: true, breaks: false, typographer: false })
+          : null;
+        function renderMarkdown(scope) {
+          var nodes = (scope || document).querySelectorAll('[data-md]:not([data-rendered])');
+          for (var i = 0; i < nodes.length; i++) {
+            var el = nodes[i];
+            var src = decodeURIComponent(el.getAttribute('data-md') || '');
+            if (md) { el.innerHTML = md.render(src); }
+            else { var d = document.createElement('div'); d.textContent = src; el.innerHTML = '<p>' + d.innerHTML + '</p>'; }
+            el.setAttribute('data-rendered', '1');
+          }
+        }
         function nearBottom() {
           var doc = document.documentElement;
           return (doc.scrollHeight - window.scrollY - window.innerHeight) < 48;
@@ -451,6 +498,7 @@ struct MessageTimelineWebView: View {
             d.innerHTML = htmls[i];
             if (d.firstElementChild) c.appendChild(d.firstElementChild);
           }
+          renderMarkdown(c);
           if (pinned) scrollToBottom();
           updateJump();
         }
@@ -458,8 +506,20 @@ struct MessageTimelineWebView: View {
           var pinned = nearBottom();
           var c = document.getElementById('container');
           if (c.lastElementChild) c.lastElementChild.outerHTML = html;
+          renderMarkdown(c);
           if (pinned) scrollToBottom();
           updateJump();
+        }
+        function toggleCollapsible(head) {
+          var c = head.parentElement;
+          var wasPinned = nearBottom();
+          c.classList.toggle('open');
+          if (wasPinned) {
+            // Keep the bottom anchored as the height animates open/closed.
+            var t0 = Date.now();
+            var tick = function () { scrollToBottom(); if (Date.now() - t0 < 340) requestAnimationFrame(tick); };
+            requestAnimationFrame(tick);
+          }
         }
         function copyFromAttr(e, el) {
           e.preventDefault(); e.stopPropagation();
@@ -478,6 +538,7 @@ struct MessageTimelineWebView: View {
         }
         window.addEventListener('scroll', updateJump, { passive: true });
         window.addEventListener('load', function () {
+          renderMarkdown(document);
           scrollToBottom();
           requestAnimationFrame(function () {
             scrollToBottom();

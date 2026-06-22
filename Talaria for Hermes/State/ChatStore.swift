@@ -1225,15 +1225,41 @@ extension ChatStore {
                 toolCalls: nil, toolCallId: nil, toolName: nil,
                 timestamp: t, finishReason: nil, reasoning: nil, reasoningContent: nil
             )))
-            messages.append(TimelineMessage(message: HermesMessage(
-                id: i * 2 + 1, sessionId: sessionID, role: "assistant",
-                content: """
+            // Every 5th reply gets rich markdown (table, nested list, code, inline
+            // styles) so the markdown renderer can be eyeballed in the harness.
+            let content: String
+            if i % 5 == 4 {
+                content = """
+                Reply \(i + 1). Here's a **richer** rundown with _formatting_ and ~~edits~~.
+
+                | Metric | Value | Trend |
+                | --- | ---: | :---: |
+                | Latency | 142ms | ↓ |
+                | Errors | 3 | → |
+
+                1. First step with `inline code`
+                   - nested detail A
+                   - nested detail B
+                2. Second step → see [the docs](https://example.com)
+
+                ```swift
+                let x = items.filter { $0.isReady }
+                ```
+
+                > A blockquote to round it out.
+                """
+            } else {
+                content = """
                 Reply \(i + 1). Item #\(i + 1) is on track.
 
                 - First point about item \(i + 1).
                 - Second point with a bit more detail so the bubble has real height.
                 - Third point to round it out.
-                """,
+                """
+            }
+            messages.append(TimelineMessage(message: HermesMessage(
+                id: i * 2 + 1, sessionId: sessionID, role: "assistant",
+                content: content,
                 toolCalls: nil, toolCallId: nil, toolName: nil,
                 timestamp: t + 30, finishReason: "stop", reasoning: nil, reasoningContent: nil
             )))
