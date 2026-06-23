@@ -1,6 +1,7 @@
 import PhotosUI
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 struct ChatView: View {
     let session: Session
@@ -21,15 +22,14 @@ struct ChatView: View {
     @State private var showPhotoPicker: Bool = false
     @State private var showFilePicker: Bool = false
     @State private var photoSelections: [PhotosPickerItem] = []
+    #if targetEnvironment(macCatalyst)
+    @State private var isDragOver = false
+    #endif
 
     var body: some View {
         Group {
             if let store {
-                MessageTimelineWebView(
-                    store: store,
-                    onDropFiles: { urls in attachFiles(at: urls) },
-                    onDropImageData: { raw in appendPhotoData(raw, name: "Image \(attachments.count + 1)") }
-                )
+                MessageTimelineWebView(store: store)
                     .safeAreaInset(edge: .bottom, spacing: 0) {
                         VStack(spacing: 0) {
                             // Actionable approval card (Runs API path only).
@@ -51,6 +51,18 @@ struct ChatView: View {
                                 onAttachPhoto: { showPhotoPicker = true },
                                 onAttachFile: { showFilePicker = true }
                             )
+                            #if targetEnvironment(macCatalyst)
+                            .onDrop(of: [.fileURL, .image], isTargeted: $isDragOver, perform: handleDrop)
+                            .overlay {
+                                if isDragOver {
+                                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                                        .strokeBorder(Color.accentColor, lineWidth: 2)
+                                        .padding(.horizontal, Spacing.m)
+                                        .padding(.vertical, Spacing.xs)
+                                        .allowsHitTesting(false)
+                                }
+                            }
+                            #endif
                         }
                         .animation(.easeInOut(duration: 0.25), value: store.pendingApproval != nil)
                     }
@@ -178,6 +190,36 @@ struct ChatView: View {
         let data = ImageDownscaler.prepareForUpload(raw) ?? raw
         attachments.append(ComposerAttachment(name: name, kind: .photo, data: data))
     }
+
+    #if targetEnvironment(macCatalyst)
+    private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard !providers.isEmpty else { return false }
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                    let url: URL?
+                    if let nsURL = item as? NSURL { url = nsURL as URL }
+                    else if let data = item as? Data { url = URL(dataRepresentation: data, relativeTo: nil) }
+                    else { url = nil }
+                    guard let url else { return }
+                    Task { @MainActor in
+                        guard let data = readPickedFile(at: url) else { return }
+                        let name = url.lastPathComponent
+                        let isImage = UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) ?? false
+                        if isImage { appendPhotoData(data, name: name) }
+                        else { attachments.append(ComposerAttachment(name: name, kind: .file, data: data)) }
+                    }
+                }
+            } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
+                    guard let raw = data else { return }
+                    Task { @MainActor in appendPhotoData(raw, name: "Image \(attachments.count + 1)") }
+                }
+            }
+        }
+        return true
+    }
+    #endif
 
     private func attachFiles(at urls: [URL]) {
         var failed: [String] = []

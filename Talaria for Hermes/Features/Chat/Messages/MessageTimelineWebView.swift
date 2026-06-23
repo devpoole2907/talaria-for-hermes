@@ -1,5 +1,4 @@
 import SwiftUI
-import UniformTypeIdentifiers
 import WebKit
 
 /// Chat timeline rendered in a native iOS 26 `WebView`. The browser engine lays out
@@ -15,11 +14,8 @@ import WebKit
 struct MessageTimelineWebView: View {
     let store: ChatStore
     var bottomPadding: CGFloat = 0
-    var onDropFiles: ([URL]) -> Void = { _ in }
-    var onDropImageData: (Data) -> Void = { _ in }
 
     @State private var page = WebPage()
-    @State private var isDragOver = false
     @State private var renderedIDs: [String] = []
     @State private var lastTurnSignature = ""
     @State private var didLoad = false
@@ -46,17 +42,6 @@ struct MessageTimelineWebView: View {
                     // gesture stopped working when the timeline became a WebView. Reach
                     // the underlying WKWebView's scroll view and restore it natively.
                     .background(WebKeyboardDismissConfigurator())
-                    #endif
-                    #if targetEnvironment(macCatalyst)
-                    // WKWebView intercepts all drag sessions before SwiftUI .onDrop
-                    // can see them, so we attach UIDropInteraction directly to the
-                    // web view via the same UIView probe/walk used for keyboard dismiss.
-                    .background(WebDropInteractionInstaller(
-                        onDropFiles: onDropFiles,
-                        onDropImageData: onDropImageData,
-                        onDragActiveChanged: { isDragOver = $0 }
-                    ))
-                    .overlay { if isDragOver { DropTargetOverlay() } }
                     #endif
                     .task { await sync() }
                     .onChange(of: store.turns.count) { Task { await sync() } }
@@ -661,27 +646,12 @@ struct MessageTimelineWebView: View {
 }
 
 #if canImport(UIKit)
-/// Walks outward from `probe`, returning the nearest `WKWebView` found in any
-/// ancestor's subtree. Shared by the keyboard-dismiss and drop-interaction installers.
-private func nearestWKWebView(from probe: UIView) -> WKWebView? {
-    var ancestor: UIView? = probe.superview
-    while let current = ancestor {
-        if let found = descendantWKWebView(in: current) { return found }
-        ancestor = current.superview
-    }
-    return nil
-}
-
-private func descendantWKWebView(in view: UIView) -> WKWebView? {
-    if let wk = view as? WKWebView { return wk }
-    for sub in view.subviews {
-        if let found = descendantWKWebView(in: sub) { return found }
-    }
-    return nil
-}
-
-/// Restores swipe-to-dismiss-keyboard on the timeline WebView's underlying scroll
-/// view (`.scrollDismissesKeyboard` can't reach through the SwiftUI WebView wrapper).
+/// Restores swipe-to-dismiss-keyboard for the timeline WebView. The iOS 26 SwiftUI
+/// `WebView` doesn't surface its scroll view to `.scrollDismissesKeyboard`, so we
+/// reach the nearest `WKWebView`'s `scrollView` from a zero-size probe placed in
+/// the WebView's background and set `keyboardDismissMode = .interactive` (drag the
+/// keyboard down as you scroll the history, like Messages). Idempotent and re-applied
+/// on every view update, so it catches the scroll view once WebKit has built it.
 private struct WebKeyboardDismissConfigurator: UIViewRepresentable {
     func makeUIView(context: Context) -> UIView {
         let probe = UIView(frame: .zero)
@@ -692,111 +662,30 @@ private struct WebKeyboardDismissConfigurator: UIViewRepresentable {
 
     func updateUIView(_ probe: UIView, context: Context) {
         DispatchQueue.main.async {
-            guard let scrollView = nearestWKWebView(from: probe)?.scrollView else { return }
+            guard let scrollView = Self.nearestWebScrollView(from: probe) else { return }
             if scrollView.keyboardDismissMode != .interactive {
                 scrollView.keyboardDismissMode = .interactive
             }
         }
     }
-}
-#endif
 
-#if targetEnvironment(macCatalyst)
-/// Attaches a `UIDropInteraction` to the nearest `WKWebView` so that files and
-/// images dragged from Finder (or any app) are handled by the app rather than
-/// swallowed by WebKit's own drag handling.
-private struct WebDropInteractionInstaller: UIViewRepresentable {
-    var onDropFiles: ([URL]) -> Void
-    var onDropImageData: (Data) -> Void
-    var onDragActiveChanged: (Bool) -> Void
-
-    func makeUIView(context: Context) -> UIView {
-        let probe = UIView(frame: .zero)
-        probe.isUserInteractionEnabled = false
-        probe.isHidden = true
-        return probe
+    /// Walks outward from the probe; the first ancestor subtree containing a
+    /// `WKWebView` is the timeline's own web view (avoids grabbing an unrelated one).
+    private static func nearestWebScrollView(from probe: UIView) -> UIScrollView? {
+        var ancestor: UIView? = probe.superview
+        while let current = ancestor {
+            if let scrollView = descendantWebScrollView(in: current) { return scrollView }
+            ancestor = current.superview
+        }
+        return nil
     }
 
-    func updateUIView(_ probe: UIView, context: Context) {
-        context.coordinator.onDropFiles = onDropFiles
-        context.coordinator.onDropImageData = onDropImageData
-        context.coordinator.onDragActiveChanged = onDragActiveChanged
-        DispatchQueue.main.async {
-            guard let webView = nearestWKWebView(from: probe),
-                  !context.coordinator.isInstalled(on: webView) else { return }
-            context.coordinator.install(on: webView)
+    private static func descendantWebScrollView(in view: UIView) -> UIScrollView? {
+        if let web = view as? WKWebView { return web.scrollView }
+        for sub in view.subviews {
+            if let found = descendantWebScrollView(in: sub) { return found }
         }
-    }
-
-    func makeCoordinator() -> Coordinator { Coordinator() }
-
-    final class Coordinator: NSObject, UIDropInteractionDelegate {
-        var onDropFiles: ([URL]) -> Void = { _ in }
-        var onDropImageData: (Data) -> Void = { _ in }
-        var onDragActiveChanged: (Bool) -> Void = { _ in }
-        private weak var installedWebView: WKWebView?
-
-        func isInstalled(on webView: WKWebView) -> Bool { installedWebView === webView }
-
-        func install(on webView: WKWebView) {
-            installedWebView = webView
-            webView.addInteraction(UIDropInteraction(delegate: self))
-        }
-
-        func dropInteraction(_ interaction: UIDropInteraction, canHandle session: UIDropSession) -> Bool {
-            session.hasItemsConforming(toTypeIdentifiers: [UTType.fileURL.identifier, UTType.image.identifier])
-        }
-
-        func dropInteraction(_ interaction: UIDropInteraction, sessionDidUpdate session: UIDropSession) -> UIDropProposal {
-            onDragActiveChanged(true)
-            return UIDropProposal(operation: .copy)
-        }
-
-        func dropInteraction(_ interaction: UIDropInteraction, sessionDidExit session: UIDropSession) {
-            onDragActiveChanged(false)
-        }
-
-        func dropInteraction(_ interaction: UIDropInteraction, sessionDidEnd session: UIDropSession) {
-            onDragActiveChanged(false)
-        }
-
-        func dropInteraction(_ interaction: UIDropInteraction, performDrop session: UIDropSession) {
-            onDragActiveChanged(false)
-            for item in session.items {
-                let provider = item.itemProvider
-                if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
-                    provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { [weak self] item, _ in
-                        guard let self else { return }
-                        let url: URL?
-                        if let nsURL = item as? NSURL { url = nsURL as URL }
-                        else if let data = item as? Data { url = URL(dataRepresentation: data, relativeTo: nil) }
-                        else { url = nil }
-                        if let url { DispatchQueue.main.async { self.onDropFiles([url]) } }
-                    }
-                } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
-                    provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { [weak self] data, _ in
-                        guard let data, let self else { return }
-                        DispatchQueue.main.async { self.onDropImageData(data) }
-                    }
-                }
-            }
-        }
-    }
-}
-
-private struct DropTargetOverlay: View {
-    var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color.accentColor.opacity(0.08))
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [8]))
-            Label("Drop to Attach", systemImage: "paperclip")
-                .font(.headline)
-                .foregroundStyle(Color.accentColor)
-        }
-        .padding()
-        .allowsHitTesting(false)
+        return nil
     }
 }
 #endif
