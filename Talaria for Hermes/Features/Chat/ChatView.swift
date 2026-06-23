@@ -525,16 +525,20 @@ enum SecurityScopedFileReader {
     }
 }
 
-/// Adds file/image drag-and-drop to the composer's message field.
+/// Adds file/image drag-and-drop to the composer's message field on Mac Catalyst.
 ///
-/// SwiftUI's `.onDrop` — and even a `UIDropInteraction` on a hit-test-stealing overlay
-/// — lose to the `TextField`'s *own* built-in drop handling on Mac Catalyst: a dropped
-/// CSV gets its text pasted into the field before our handlers ever run. The reliable
-/// fix is to drive that text field's own drop pipeline. We walk the view tree to the
-/// backing text input (`UITextDroppable`), become its `textDropDelegate`, and for a
-/// file/image drop return a proposal whose `dropPerformer` is `.delegate` — so UIKit
-/// hands the drop to us (no text inserted) and we turn it into an attachment instead.
-/// Plain-text drags still fall through to normal text insertion.
+/// Catalyst routes dropped content two different ways, so we need both halves:
+///
+/// * **Text-like files** (CSV, plain text, …) reach the text field's own drop pipeline.
+///   We become its `textDropDelegate`; for a file we return a proposal whose
+///   `dropPerformer` is `.delegate`, so UIKit hands the drop to us (no text inserted)
+///   and we attach it. A bare text *selection* still falls through to normal insertion.
+/// * **Binary files** (docx, pdf, images, …) are rejected by the text field and never
+///   reach `textDropDelegate` at all. For those we add a `UIDropInteraction` to the
+///   same text field, which receives every drop type.
+///
+/// The two paths are partitioned by whether the drop conforms to `public.text`, so a
+/// given drop is only ever handled once.
 struct ComposerTextDropInstaller: UIViewRepresentable {
     /// Called on the main thread with a non-image file's bytes and name.
     var onDropFile: (Data, String) -> Void
@@ -551,11 +555,12 @@ struct ComposerTextDropInstaller: UIViewRepresentable {
     }
 
     func updateUIView(_ probe: UIView, context: Context) {
-        context.coordinator.onDropFile = onDropFile
-        context.coordinator.onDropImage = onDropImage
-        context.coordinator.onTargetedChanged = onTargetedChanged
+        let coordinator = context.coordinator
+        coordinator.onDropFile = onDropFile
+        coordinator.onDropImage = onDropImage
+        coordinator.onTargetedChanged = onTargetedChanged
         // Defer so the text field is in the hierarchy when we search; re-applied on
-        // every update so it re-attaches if WebKit/SwiftUI rebuilds the field.
+        // every update so it re-attaches if SwiftUI rebuilds the field.
         DispatchQueue.main.async {
             guard let droppable = Self.nearestTextDroppable(from: probe) else {
                 #if DEBUG
@@ -563,10 +568,19 @@ struct ComposerTextDropInstaller: UIViewRepresentable {
                 #endif
                 return
             }
-            if droppable.textDropDelegate !== context.coordinator {
-                droppable.textDropDelegate = context.coordinator
+            if droppable.textDropDelegate !== coordinator {
+                droppable.textDropDelegate = coordinator
                 #if DEBUG
                 print("[ComposerDrop] attached textDropDelegate to \(type(of: droppable))")
+                #endif
+            }
+            // Add a UIDropInteraction for the binary-file drops that bypass the text
+            // pipeline. Only once per field (coordinator tracks where it installed).
+            if !coordinator.hasDropInteraction(on: droppable) {
+                droppable.addInteraction(UIDropInteraction(delegate: coordinator))
+                coordinator.didInstallDropInteraction(on: droppable)
+                #if DEBUG
+                print("[ComposerDrop] added UIDropInteraction to \(type(of: droppable))")
                 #endif
             }
         }
@@ -593,38 +607,67 @@ struct ComposerTextDropInstaller: UIViewRepresentable {
         return nil
     }
 
-    final class Coordinator: NSObject, UITextDropDelegate {
+    final class Coordinator: NSObject, UITextDropDelegate, UIDropInteractionDelegate {
         var onDropFile: (Data, String) -> Void = { _, _ in }
         var onDropImage: (Data, String) -> Void = { _, _ in }
         var onTargetedChanged: (Bool) -> Void = { _ in }
 
-        /// A file or image drag (vs. a plain-text selection we let the field insert).
-        /// Catalyst Finder drags don't reliably advertise `public.file-url`, so detect
-        /// a file by its `suggestedName` (a text selection has none) as well.
+        private weak var dropInteractionView: UIView?
+        func hasDropInteraction(on view: UIView) -> Bool { dropInteractionView === view }
+        func didInstallDropInteraction(on view: UIView) { dropInteractionView = view }
+
+        // MARK: Drop classification
+
+        /// True when the drop carries a file we should attach rather than insert as
+        /// text. A bare plain-text *selection* registers only the plain-text UTIs; a
+        /// dropped file — even a text-based one like CSV — registers its own concrete
+        /// UTI (and/or a file URL / suggested name), which is what we key on.
         private static func isAttachable(_ session: UIDropSession) -> Bool {
             for item in session.items {
                 let provider = item.itemProvider
                 if provider.suggestedName != nil { return true }
                 if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) { return true }
                 if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) { return true }
+                if provider.registeredTypeIdentifiers.contains(where: { !Self.plainTextTypes.contains($0) }) {
+                    return true
+                }
             }
             return session.canLoadObjects(ofClass: URL.self)
         }
 
+        /// The drop conforms to `public.text`, so it travels the text field's own drop
+        /// pipeline (handled by the `textDropDelegate` half). Used to keep the
+        /// `UIDropInteraction` half from double-handling those.
+        private static func isTextLike(_ session: UIDropSession) -> Bool {
+            session.hasItemsConforming(toTypeIdentifiers: [UTType.text.identifier])
+        }
+
+        /// The plain-text UTIs a bare selection registers — these we let the field
+        /// insert normally instead of attaching.
+        private static let plainTextTypes: Set<String> = [
+            "public.text",
+            "public.plain-text",
+            "public.utf8-plain-text",
+            "public.utf16-plain-text",
+            "public.utf16-external-plain-text",
+        ]
+
+        // MARK: UITextDropDelegate (text-like drops)
+
         func textDroppableView(_ textDroppableView: UIView & UITextDroppable, proposalForDrop drop: UITextDropRequest) -> UITextDropProposal {
             #if DEBUG
             for item in drop.dropSession.items {
-                print("[ComposerDrop] proposal item name=\(item.itemProvider.suggestedName ?? "nil") types=\(item.itemProvider.registeredTypeIdentifiers)")
+                print("[ComposerDrop] text-proposal name=\(item.itemProvider.suggestedName ?? "nil") types=\(item.itemProvider.registeredTypeIdentifiers)")
             }
             #endif
             guard Self.isAttachable(drop.dropSession) else {
                 #if DEBUG
-                print("[ComposerDrop] proposal -> .copy (let the field insert text)")
+                print("[ComposerDrop] text-proposal -> .copy (let the field insert text)")
                 #endif
                 return UITextDropProposal(operation: .copy)
             }
             #if DEBUG
-            print("[ComposerDrop] proposal -> .delegate (we handle the drop)")
+            print("[ComposerDrop] text-proposal -> .delegate (we attach it)")
             #endif
             let proposal = UITextDropProposal(operation: .copy)
             proposal.dropPerformer = .delegate // we perform it in willPerformDrop
@@ -633,12 +676,10 @@ struct ComposerTextDropInstaller: UIViewRepresentable {
 
         func textDroppableView(_ textDroppableView: UIView & UITextDroppable, willPerformDrop drop: UITextDropRequest) {
             #if DEBUG
-            print("[ComposerDrop] willPerformDrop items=\(drop.dropSession.items.count)")
+            print("[ComposerDrop] text-willPerformDrop items=\(drop.dropSession.items.count)")
             #endif
             onTargetedChanged(false)
-            for item in drop.dropSession.items {
-                load(item.itemProvider)
-            }
+            for item in drop.dropSession.items { load(item.itemProvider) }
         }
 
         func textDroppableView(_ textDroppableView: UIView & UITextDroppable, dropSessionDidEnter session: UIDropSession) {
@@ -652,6 +693,48 @@ struct ComposerTextDropInstaller: UIViewRepresentable {
         func textDroppableView(_ textDroppableView: UIView & UITextDroppable, dropSessionDidEnd session: UIDropSession) {
             onTargetedChanged(false)
         }
+
+        // MARK: UIDropInteractionDelegate (binary-file drops)
+
+        func dropInteraction(_ interaction: UIDropInteraction, canHandle session: UIDropSession) -> Bool {
+            // Text-like drops are handled by the textDropDelegate half; take everything
+            // else that's a file/image here so binary types (docx, pdf, …) aren't lost.
+            let handled = Self.isAttachable(session) && !Self.isTextLike(session)
+            #if DEBUG
+            if handled {
+                for item in session.items {
+                    print("[ComposerDrop] interaction-canHandle types=\(item.itemProvider.registeredTypeIdentifiers)")
+                }
+            }
+            #endif
+            return handled
+        }
+
+        func dropInteraction(_ interaction: UIDropInteraction, sessionDidUpdate session: UIDropSession) -> UIDropProposal {
+            UIDropProposal(operation: .copy)
+        }
+
+        func dropInteraction(_ interaction: UIDropInteraction, sessionDidEnter session: UIDropSession) {
+            onTargetedChanged(true)
+        }
+
+        func dropInteraction(_ interaction: UIDropInteraction, sessionDidExit session: UIDropSession) {
+            onTargetedChanged(false)
+        }
+
+        func dropInteraction(_ interaction: UIDropInteraction, sessionDidEnd session: UIDropSession) {
+            onTargetedChanged(false)
+        }
+
+        func dropInteraction(_ interaction: UIDropInteraction, performDrop session: UIDropSession) {
+            #if DEBUG
+            print("[ComposerDrop] interaction-performDrop items=\(session.items.count)")
+            #endif
+            onTargetedChanged(false)
+            for item in session.items { load(item.itemProvider) }
+        }
+
+        // MARK: Loading
 
         /// Loads a dropped item's bytes via its data representation (works for any file
         /// type, including ones that don't vend a `public.file-url`), classifies it as
