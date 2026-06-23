@@ -22,9 +22,7 @@ struct ChatView: View {
     @State private var showPhotoPicker: Bool = false
     @State private var showFilePicker: Bool = false
     @State private var photoSelections: [PhotosPickerItem] = []
-    #if targetEnvironment(macCatalyst)
     @State private var isDragOver = false
-    #endif
 
     var body: some View {
         Group {
@@ -51,7 +49,6 @@ struct ChatView: View {
                                 onAttachPhoto: { showPhotoPicker = true },
                                 onAttachFile: { showFilePicker = true }
                             )
-                            #if targetEnvironment(macCatalyst)
                             .onDrop(of: [.fileURL, .image], isTargeted: $isDragOver, perform: handleDrop)
                             .overlay {
                                 if isDragOver {
@@ -62,7 +59,6 @@ struct ChatView: View {
                                         .allowsHitTesting(false)
                                 }
                             }
-                            #endif
                         }
                         .animation(.easeInOut(duration: 0.25), value: store.pendingApproval != nil)
                     }
@@ -191,7 +187,6 @@ struct ChatView: View {
         attachments.append(ComposerAttachment(name: name, kind: .photo, data: data))
     }
 
-    #if targetEnvironment(macCatalyst)
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
         guard !providers.isEmpty else { return false }
         for provider in providers {
@@ -219,7 +214,6 @@ struct ChatView: View {
         }
         return true
     }
-    #endif
 
     private func attachFiles(at urls: [URL]) {
         var failed: [String] = []
