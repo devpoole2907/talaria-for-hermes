@@ -49,7 +49,6 @@ struct ChatView: View {
                                 onAttachPhoto: { showPhotoPicker = true },
                                 onAttachFile: { showFilePicker = true }
                             )
-                            .onDrop(of: [.fileURL, .image], isTargeted: $isDragOver, perform: handleDrop)
                             .overlay {
                                 if isDragOver {
                                     RoundedRectangle(cornerRadius: 28, style: .continuous)
@@ -58,6 +57,20 @@ struct ChatView: View {
                                         .padding(.vertical, Spacing.xs)
                                         .allowsHitTesting(false)
                                 }
+                            }
+                            // A UIKit drop interaction layered on top: SwiftUI `.onDrop`
+                            // loses to the TextField's own built-in drop handling on
+                            // Catalyst (a dropped CSV pastes as raw text). This overlay
+                            // wins the drag hit-test yet passes normal touches through,
+                            // so typing/taps still reach the composer beneath it.
+                            .overlay {
+                                ComposerDropZone(
+                                    onDropFile: { data, name in
+                                        attachments.append(ComposerAttachment(name: name, kind: .file, data: data))
+                                    },
+                                    onDropImage: { data, name in appendPhotoData(data, name: name) },
+                                    onTargetedChanged: { isDragOver = $0 }
+                                )
                             }
                         }
                         .animation(.easeInOut(duration: 0.25), value: store.pendingApproval != nil)
@@ -187,34 +200,6 @@ struct ChatView: View {
         attachments.append(ComposerAttachment(name: name, kind: .photo, data: data))
     }
 
-    private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
-        guard !providers.isEmpty else { return false }
-        for provider in providers {
-            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
-                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-                    let url: URL?
-                    if let nsURL = item as? NSURL { url = nsURL as URL }
-                    else if let data = item as? Data { url = URL(dataRepresentation: data, relativeTo: nil) }
-                    else { url = nil }
-                    guard let url else { return }
-                    Task { @MainActor in
-                        guard let data = readPickedFile(at: url) else { return }
-                        let name = url.lastPathComponent
-                        let isImage = UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) ?? false
-                        if isImage { appendPhotoData(data, name: name) }
-                        else { attachments.append(ComposerAttachment(name: name, kind: .file, data: data)) }
-                    }
-                }
-            } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
-                provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
-                    guard let raw = data else { return }
-                    Task { @MainActor in appendPhotoData(raw, name: "Image \(attachments.count + 1)") }
-                }
-            }
-        }
-        return true
-    }
-
     private func attachFiles(at urls: [URL]) {
         var failed: [String] = []
         for url in urls {
@@ -231,20 +216,8 @@ struct ChatView: View {
         }
     }
 
-    /// Reads a picked file's bytes. Picker URLs are security-scoped, and iCloud /
-    /// third-party provider files need a coordinated read (and may need downloading
-    /// first), so a plain `Data(contentsOf:)` can return nil for them. Coordinate
-    /// the read so those cases work instead of silently failing.
     private func readPickedFile(at url: URL) -> Data? {
-        let needsStop = url.startAccessingSecurityScopedResource()
-        defer { if needsStop { url.stopAccessingSecurityScopedResource() } }
-
-        var coordinatorError: NSError?
-        var data: Data?
-        NSFileCoordinator().coordinate(readingItemAt: url, options: [.withoutChanges], error: &coordinatorError) { readURL in
-            data = try? Data(contentsOf: readURL)
-        }
-        return data
+        SecurityScopedFileReader.read(url)
     }
 
     private var errorBinding: Binding<Bool> {
@@ -528,6 +501,129 @@ struct ChatView: View {
             } catch {
                 errorMessage = HermesError(error).errorDescription
                 appModel.haptics.error()
+            }
+        }
+    }
+}
+
+/// Reads a security-scoped / coordinated file URL's bytes. Picker and dropped URLs are
+/// security-scoped, and iCloud / third-party provider files need a coordinated read
+/// (and may need downloading first), so a plain `Data(contentsOf:)` can return nil for
+/// them. Coordinate the read so those cases work instead of silently failing.
+enum SecurityScopedFileReader {
+    nonisolated static func read(_ url: URL) -> Data? {
+        let needsStop = url.startAccessingSecurityScopedResource()
+        defer { if needsStop { url.stopAccessingSecurityScopedResource() } }
+
+        var coordinatorError: NSError?
+        var data: Data?
+        NSFileCoordinator().coordinate(readingItemAt: url, options: [.withoutChanges], error: &coordinatorError) { readURL in
+            data = try? Data(contentsOf: readURL)
+        }
+        return data
+    }
+}
+
+/// A transparent overlay that captures drag-and-drop over the composer while letting
+/// normal touches (typing, button taps) pass through to the views beneath it.
+///
+/// SwiftUI's `.onDrop` doesn't work here: the composer's `TextField` is backed by a
+/// `UITextField` whose own built-in drop handling intercepts dropped files and inserts
+/// their *contents as text* (a dropped CSV pastes as raw text) before SwiftUI ever sees
+/// the drop. Placing a `UIDropInteraction` on an overlay that wins the drag hit-test
+/// runs our handler instead — and a passthrough hit-test keeps the field typable.
+struct ComposerDropZone: UIViewRepresentable {
+    /// Called on the main thread with a non-image file's bytes and name.
+    var onDropFile: (Data, String) -> Void
+    /// Called on the main thread with image bytes and a name (file image or raw image).
+    var onDropImage: (Data, String) -> Void
+    /// Drag entered (true) / left or ended (false) — drives the drop-target highlight.
+    var onTargetedChanged: (Bool) -> Void
+
+    func makeUIView(context: Context) -> UIView {
+        let view = DragPassthroughView()
+        view.backgroundColor = .clear
+        view.addInteraction(UIDropInteraction(delegate: context.coordinator))
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        // Refresh the captured closures each update so they see the latest view state.
+        context.coordinator.onDropFile = onDropFile
+        context.coordinator.onDropImage = onDropImage
+        context.coordinator.onTargetedChanged = onTargetedChanged
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    /// Returns itself for drag hit-tests (UIKit passes `event == nil` while a drag is
+    /// in flight) so the overlay's drop interaction wins over the text field's, but
+    /// returns nil for real touches so taps and typing reach the composer underneath.
+    final class DragPassthroughView: UIView {
+        override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+            if event == nil { return self.point(inside: point, with: nil) ? self : nil }
+            return nil
+        }
+    }
+
+    final class Coordinator: NSObject, UIDropInteractionDelegate {
+        var onDropFile: (Data, String) -> Void = { _, _ in }
+        var onDropImage: (Data, String) -> Void = { _, _ in }
+        var onTargetedChanged: (Bool) -> Void = { _ in }
+
+        func dropInteraction(_ interaction: UIDropInteraction, canHandle session: UIDropSession) -> Bool {
+            session.hasItemsConforming(toTypeIdentifiers: [UTType.fileURL.identifier, UTType.image.identifier])
+        }
+
+        func dropInteraction(_ interaction: UIDropInteraction, sessionDidEnter session: UIDropSession) {
+            onTargetedChanged(true)
+        }
+
+        func dropInteraction(_ interaction: UIDropInteraction, sessionDidUpdate session: UIDropSession) -> UIDropProposal {
+            UIDropProposal(operation: .copy)
+        }
+
+        func dropInteraction(_ interaction: UIDropInteraction, sessionDidExit session: UIDropSession) {
+            onTargetedChanged(false)
+        }
+
+        func dropInteraction(_ interaction: UIDropInteraction, sessionDidEnd session: UIDropSession) {
+            onTargetedChanged(false)
+        }
+
+        func dropInteraction(_ interaction: UIDropInteraction, performDrop session: UIDropSession) {
+            onTargetedChanged(false)
+            for item in session.items {
+                let provider = item.itemProvider
+                // Prefer a real file (gives a filename + lets us classify by extension);
+                // fall back to raw image data (e.g. an image dragged from a browser).
+                if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                    loadDroppedFile(from: provider)
+                } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                    provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { [weak self] data, _ in
+                        guard let self, let data else { return }
+                        DispatchQueue.main.async { self.onDropImage(data, "Pasted Image") }
+                    }
+                }
+            }
+        }
+
+        private func loadDroppedFile(from provider: NSItemProvider) {
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { [weak self] item, _ in
+                guard let self else { return }
+                let url: URL?
+                if let nsURL = item as? NSURL { url = nsURL as URL }
+                else if let data = item as? Data { url = URL(dataRepresentation: data, relativeTo: nil) }
+                else { url = nil }
+                // Read the bytes here, while the dropped URL's access is still valid —
+                // deferring the read to the main thread can miss the security-scope window.
+                guard let url, let data = SecurityScopedFileReader.read(url) else { return }
+                let name = url.lastPathComponent
+                let isImage = UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) ?? false
+                DispatchQueue.main.async {
+                    if isImage { self.onDropImage(data, name) }
+                    else { self.onDropFile(data, name) }
+                }
             }
         }
     }
