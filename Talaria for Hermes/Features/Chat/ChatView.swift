@@ -557,9 +557,17 @@ struct ComposerTextDropInstaller: UIViewRepresentable {
         // Defer so the text field is in the hierarchy when we search; re-applied on
         // every update so it re-attaches if WebKit/SwiftUI rebuilds the field.
         DispatchQueue.main.async {
-            guard let droppable = Self.nearestTextDroppable(from: probe) else { return }
+            guard let droppable = Self.nearestTextDroppable(from: probe) else {
+                #if DEBUG
+                print("[ComposerDrop] no UITextDroppable found yet")
+                #endif
+                return
+            }
             if droppable.textDropDelegate !== context.coordinator {
                 droppable.textDropDelegate = context.coordinator
+                #if DEBUG
+                print("[ComposerDrop] attached textDropDelegate to \(type(of: droppable))")
+                #endif
             }
         }
     }
@@ -591,38 +599,45 @@ struct ComposerTextDropInstaller: UIViewRepresentable {
         var onTargetedChanged: (Bool) -> Void = { _ in }
 
         /// A file or image drag (vs. a plain-text selection we let the field insert).
+        /// Catalyst Finder drags don't reliably advertise `public.file-url`, so detect
+        /// a file by its `suggestedName` (a text selection has none) as well.
         private static func isAttachable(_ session: UIDropSession) -> Bool {
-            if session.hasItemsConforming(toTypeIdentifiers: [UTType.fileURL.identifier, UTType.image.identifier]) {
-                return true
+            for item in session.items {
+                let provider = item.itemProvider
+                if provider.suggestedName != nil { return true }
+                if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) { return true }
+                if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) { return true }
             }
             return session.canLoadObjects(ofClass: URL.self)
         }
 
         func textDroppableView(_ textDroppableView: UIView & UITextDroppable, proposalForDrop drop: UITextDropRequest) -> UITextDropProposal {
+            #if DEBUG
+            for item in drop.dropSession.items {
+                print("[ComposerDrop] proposal item name=\(item.itemProvider.suggestedName ?? "nil") types=\(item.itemProvider.registeredTypeIdentifiers)")
+            }
+            #endif
             guard Self.isAttachable(drop.dropSession) else {
-                // Plain text: let the field insert it as usual.
+                #if DEBUG
+                print("[ComposerDrop] proposal -> .copy (let the field insert text)")
+                #endif
                 return UITextDropProposal(operation: .copy)
             }
+            #if DEBUG
+            print("[ComposerDrop] proposal -> .delegate (we handle the drop)")
+            #endif
             let proposal = UITextDropProposal(operation: .copy)
             proposal.dropPerformer = .delegate // we perform it in willPerformDrop
             return proposal
         }
 
         func textDroppableView(_ textDroppableView: UIView & UITextDroppable, willPerformDrop drop: UITextDropRequest) {
+            #if DEBUG
+            print("[ComposerDrop] willPerformDrop items=\(drop.dropSession.items.count)")
+            #endif
             onTargetedChanged(false)
-            guard Self.isAttachable(drop.dropSession) else { return }
             for item in drop.dropSession.items {
-                let provider = item.itemProvider
-                // Prefer a real file (gives a filename + lets us classify by extension);
-                // fall back to raw image data (e.g. an image dragged from a browser).
-                if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
-                    loadDroppedFile(from: provider)
-                } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
-                    provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { [weak self] data, _ in
-                        guard let self, let data else { return }
-                        DispatchQueue.main.async { self.onDropImage(data, "Pasted Image") }
-                    }
-                }
+                load(item.itemProvider)
             }
         }
 
@@ -638,17 +653,67 @@ struct ComposerTextDropInstaller: UIViewRepresentable {
             onTargetedChanged(false)
         }
 
-        private func loadDroppedFile(from provider: NSItemProvider) {
+        /// Loads a dropped item's bytes via its data representation (works for any file
+        /// type, including ones that don't vend a `public.file-url`), classifies it as
+        /// image or file, and forwards it on the main thread.
+        private func load(_ provider: NSItemProvider) {
+            let name = provider.suggestedName ?? "Dropped File"
+            // Raw image with no backing file (e.g. dragged from a browser).
+            if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier),
+               !provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { [weak self] data, error in
+                    #if DEBUG
+                    print("[ComposerDrop] image load bytes=\(data?.count ?? -1) error=\(String(describing: error))")
+                    #endif
+                    guard let self, let data else { return }
+                    DispatchQueue.main.async { self.onDropImage(data, name) }
+                }
+                return
+            }
+            guard let typeID = Self.fileTypeIdentifier(for: provider) else {
+                #if DEBUG
+                print("[ComposerDrop] no loadable content type in \(provider.registeredTypeIdentifiers); trying file URL")
+                #endif
+                loadViaFileURL(provider, fallbackName: name)
+                return
+            }
+            provider.loadDataRepresentation(forTypeIdentifier: typeID) { [weak self] data, error in
+                #if DEBUG
+                print("[ComposerDrop] file load type=\(typeID) bytes=\(data?.count ?? -1) error=\(String(describing: error))")
+                #endif
+                guard let self, let data else { return }
+                let isImage = UTType(typeID)?.conforms(to: .image) ?? false
+                DispatchQueue.main.async {
+                    if isImage { self.onDropImage(data, name) }
+                    else { self.onDropFile(data, name) }
+                }
+            }
+        }
+
+        /// The richest concrete content type the provider can vend as raw bytes,
+        /// skipping URL wrappers (`public.file-url`/`public.url`) whose "bytes" are the
+        /// path string rather than the file's contents.
+        private static func fileTypeIdentifier(for provider: NSItemProvider) -> String? {
+            for id in provider.registeredTypeIdentifiers {
+                guard let type = UTType(id) else { continue }
+                if type.conforms(to: .url) { continue }
+                if type.conforms(to: .data) || type.conforms(to: .content) { return id }
+            }
+            return nil
+        }
+
+        /// Fallback for providers that only vend a file URL: read the file's bytes
+        /// while the dropped URL's security-scoped access is still valid.
+        private func loadViaFileURL(_ provider: NSItemProvider, fallbackName: String) {
+            guard provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) else { return }
             provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { [weak self] item, _ in
                 guard let self else { return }
                 let url: URL?
                 if let nsURL = item as? NSURL { url = nsURL as URL }
                 else if let data = item as? Data { url = URL(dataRepresentation: data, relativeTo: nil) }
                 else { url = nil }
-                // Read the bytes here, while the dropped URL's access is still valid —
-                // deferring the read to the main thread can miss the security-scope window.
                 guard let url, let data = SecurityScopedFileReader.read(url) else { return }
-                let name = url.lastPathComponent
+                let name = url.lastPathComponent.isEmpty ? fallbackName : url.lastPathComponent
                 let isImage = UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) ?? false
                 DispatchQueue.main.async {
                     if isImage { self.onDropImage(data, name) }
