@@ -58,20 +58,21 @@ struct ChatView: View {
                                         .allowsHitTesting(false)
                                 }
                             }
-                            // A UIKit drop interaction layered on top: SwiftUI `.onDrop`
-                            // loses to the TextField's own built-in drop handling on
-                            // Catalyst (a dropped CSV pastes as raw text). This overlay
-                            // wins the drag hit-test yet passes normal touches through,
-                            // so typing/taps still reach the composer beneath it.
-                            .overlay {
-                                ComposerDropZone(
+                            // SwiftUI `.onDrop` and an overlay UIDropInteraction both lose
+                            // to the message TextField's own built-in drop handling on
+                            // Catalyst (a dropped CSV pastes its text into the field). The
+                            // reliable fix is to hook that text field's *own* drop pipeline
+                            // via textDropDelegate and tell UIKit the delegate performs the
+                            // drop — so files/images become attachments and no text inserts.
+                            .background(
+                                ComposerTextDropInstaller(
                                     onDropFile: { data, name in
                                         attachments.append(ComposerAttachment(name: name, kind: .file, data: data))
                                     },
                                     onDropImage: { data, name in appendPhotoData(data, name: name) },
                                     onTargetedChanged: { isDragOver = $0 }
                                 )
-                            }
+                            )
                         }
                         .animation(.easeInOut(duration: 0.25), value: store.pendingApproval != nil)
                     }
@@ -524,15 +525,17 @@ enum SecurityScopedFileReader {
     }
 }
 
-/// A transparent overlay that captures drag-and-drop over the composer while letting
-/// normal touches (typing, button taps) pass through to the views beneath it.
+/// Adds file/image drag-and-drop to the composer's message field.
 ///
-/// SwiftUI's `.onDrop` doesn't work here: the composer's `TextField` is backed by a
-/// `UITextField` whose own built-in drop handling intercepts dropped files and inserts
-/// their *contents as text* (a dropped CSV pastes as raw text) before SwiftUI ever sees
-/// the drop. Placing a `UIDropInteraction` on an overlay that wins the drag hit-test
-/// runs our handler instead — and a passthrough hit-test keeps the field typable.
-struct ComposerDropZone: UIViewRepresentable {
+/// SwiftUI's `.onDrop` — and even a `UIDropInteraction` on a hit-test-stealing overlay
+/// — lose to the `TextField`'s *own* built-in drop handling on Mac Catalyst: a dropped
+/// CSV gets its text pasted into the field before our handlers ever run. The reliable
+/// fix is to drive that text field's own drop pipeline. We walk the view tree to the
+/// backing text input (`UITextDroppable`), become its `textDropDelegate`, and for a
+/// file/image drop return a proposal whose `dropPerformer` is `.delegate` — so UIKit
+/// hands the drop to us (no text inserted) and we turn it into an attachment instead.
+/// Plain-text drags still fall through to normal text insertion.
+struct ComposerTextDropInstaller: UIViewRepresentable {
     /// Called on the main thread with a non-image file's bytes and name.
     var onDropFile: (Data, String) -> Void
     /// Called on the main thread with image bytes and a name (file image or raw image).
@@ -541,59 +544,74 @@ struct ComposerDropZone: UIViewRepresentable {
     var onTargetedChanged: (Bool) -> Void
 
     func makeUIView(context: Context) -> UIView {
-        let view = DragPassthroughView()
-        view.backgroundColor = .clear
-        view.addInteraction(UIDropInteraction(delegate: context.coordinator))
-        return view
+        let probe = UIView(frame: .zero)
+        probe.isUserInteractionEnabled = false
+        probe.isHidden = true
+        return probe
     }
 
-    func updateUIView(_ uiView: UIView, context: Context) {
-        // Refresh the captured closures each update so they see the latest view state.
+    func updateUIView(_ probe: UIView, context: Context) {
         context.coordinator.onDropFile = onDropFile
         context.coordinator.onDropImage = onDropImage
         context.coordinator.onTargetedChanged = onTargetedChanged
+        // Defer so the text field is in the hierarchy when we search; re-applied on
+        // every update so it re-attaches if WebKit/SwiftUI rebuilds the field.
+        DispatchQueue.main.async {
+            guard let droppable = Self.nearestTextDroppable(from: probe) else { return }
+            if droppable.textDropDelegate !== context.coordinator {
+                droppable.textDropDelegate = context.coordinator
+            }
+        }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    /// Returns itself for drag hit-tests (UIKit passes `event == nil` while a drag is
-    /// in flight) so the overlay's drop interaction wins over the text field's, but
-    /// returns nil for real touches so taps and typing reach the composer underneath.
-    final class DragPassthroughView: UIView {
-        override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-            if event == nil { return self.point(inside: point, with: nil) ? self : nil }
-            return nil
+    /// Walks outward from the probe; the first ancestor subtree containing a text input
+    /// is the composer's message field (the probe sits in that composer's background).
+    private static func nearestTextDroppable(from probe: UIView) -> (UIView & UITextDroppable)? {
+        var ancestor: UIView? = probe.superview
+        while let current = ancestor {
+            if let found = descendantTextDroppable(in: current) { return found }
+            ancestor = current.superview
         }
+        return nil
     }
 
-    final class Coordinator: NSObject, UIDropInteractionDelegate {
+    private static func descendantTextDroppable(in view: UIView) -> (UIView & UITextDroppable)? {
+        if let droppable = view as? (UIView & UITextDroppable) { return droppable }
+        for sub in view.subviews {
+            if let found = descendantTextDroppable(in: sub) { return found }
+        }
+        return nil
+    }
+
+    final class Coordinator: NSObject, UITextDropDelegate {
         var onDropFile: (Data, String) -> Void = { _, _ in }
         var onDropImage: (Data, String) -> Void = { _, _ in }
         var onTargetedChanged: (Bool) -> Void = { _ in }
 
-        func dropInteraction(_ interaction: UIDropInteraction, canHandle session: UIDropSession) -> Bool {
-            session.hasItemsConforming(toTypeIdentifiers: [UTType.fileURL.identifier, UTType.image.identifier])
+        /// A file or image drag (vs. a plain-text selection we let the field insert).
+        private static func isAttachable(_ session: UIDropSession) -> Bool {
+            if session.hasItemsConforming(toTypeIdentifiers: [UTType.fileURL.identifier, UTType.image.identifier]) {
+                return true
+            }
+            return session.canLoadObjects(ofClass: URL.self)
         }
 
-        func dropInteraction(_ interaction: UIDropInteraction, sessionDidEnter session: UIDropSession) {
-            onTargetedChanged(true)
+        func textDroppableView(_ textDroppableView: UIView & UITextDroppable, proposalForDrop drop: UITextDropRequest) -> UITextDropProposal {
+            guard Self.isAttachable(drop.dropSession) else {
+                // Plain text: let the field insert it as usual.
+                return UITextDropProposal(operation: .copy)
+            }
+            let proposal = UITextDropProposal(operation: .copy)
+            proposal.dropPerformer = .delegate // we perform it in willPerformDrop
+            return proposal
         }
 
-        func dropInteraction(_ interaction: UIDropInteraction, sessionDidUpdate session: UIDropSession) -> UIDropProposal {
-            UIDropProposal(operation: .copy)
-        }
-
-        func dropInteraction(_ interaction: UIDropInteraction, sessionDidExit session: UIDropSession) {
+        func textDroppableView(_ textDroppableView: UIView & UITextDroppable, willPerformDrop drop: UITextDropRequest) {
             onTargetedChanged(false)
-        }
-
-        func dropInteraction(_ interaction: UIDropInteraction, sessionDidEnd session: UIDropSession) {
-            onTargetedChanged(false)
-        }
-
-        func dropInteraction(_ interaction: UIDropInteraction, performDrop session: UIDropSession) {
-            onTargetedChanged(false)
-            for item in session.items {
+            guard Self.isAttachable(drop.dropSession) else { return }
+            for item in drop.dropSession.items {
                 let provider = item.itemProvider
                 // Prefer a real file (gives a filename + lets us classify by extension);
                 // fall back to raw image data (e.g. an image dragged from a browser).
@@ -606,6 +624,18 @@ struct ComposerDropZone: UIViewRepresentable {
                     }
                 }
             }
+        }
+
+        func textDroppableView(_ textDroppableView: UIView & UITextDroppable, dropSessionDidEnter session: UIDropSession) {
+            if Self.isAttachable(session) { onTargetedChanged(true) }
+        }
+
+        func textDroppableView(_ textDroppableView: UIView & UITextDroppable, dropSessionDidExit session: UIDropSession) {
+            onTargetedChanged(false)
+        }
+
+        func textDroppableView(_ textDroppableView: UIView & UITextDroppable, dropSessionDidEnd session: UIDropSession) {
+            onTargetedChanged(false)
         }
 
         private func loadDroppedFile(from provider: NSItemProvider) {
