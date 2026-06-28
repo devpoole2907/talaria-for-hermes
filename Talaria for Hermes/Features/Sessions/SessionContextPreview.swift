@@ -3,15 +3,17 @@ import SwiftUI
 /// Context-menu preview that mirrors the chat view for a session: a slim title bar
 /// over the tail of the conversation rendered as native chat bubbles.
 ///
-/// Messages come from the local persistence cache (passed in by the list), so the
-/// preview appears instantly with no network fetch — and, crucially, previewing a
-/// session never triggers a load or run recovery the way mounting the real ChatView
-/// would. Falls back to the server-provided last-message snippet when a session has
-/// no locally cached history yet.
+/// Messages come from the local persistence cache, loaded only when the preview view
+/// appears. Previewing a session never triggers a network load or run recovery the
+/// way mounting the real ChatView would. Falls back to the server-provided
+/// last-message snippet when a session has no locally cached history yet.
 struct SessionContextPreview: View {
     let session: Session
-    let messages: [TimelineMessage]
     let isPinned: Bool
+    let loadMessages: @MainActor () -> [TimelineMessage]
+
+    @State private var messages: [TimelineMessage] = []
+    @State private var loadedSessionID: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -21,6 +23,11 @@ struct SessionContextPreview: View {
         }
         .frame(width: 320)
         .background(.background)
+        .onAppear {
+            guard loadedSessionID != session.id else { return }
+            loadedSessionID = session.id
+            messages = loadMessages()
+        }
     }
 
     // MARK: - Header (mimics the chat nav bar)

@@ -99,14 +99,26 @@ struct ChatView: View {
             }
         }
         .onChange(of: scenePhase) { _, phase in
-            // Returning to the foreground: resume any run whose stream was dropped
-            // while the app was suspended, instead of leaving it stuck.
-            if phase == .active {
+            switch phase {
+            case .active:
+                // Returning to the foreground: end the background-task assertion (the
+                // socket either survived the grace period or dropped and recovery is
+                // about to re-attach it), then resume any run whose stream was dropped
+                // while the app was suspended.
+                store?.endBackgroundGrace()
                 if store?.useRunsAPI == true {
                     store?.recoverRunsAPIRunIfNeeded()
                 } else {
                     store?.recoverIfNeeded()
                 }
+            case .inactive, .background:
+                // Moving to the background (or through inactive on the way there): take
+                // a UIApplication background-task assertion so iOS grants ~30 s of extra
+                // CPU time. That keeps the SSE socket alive across brief app-switches,
+                // avoiding the server-side stream teardown entirely for short absences.
+                store?.beginBackgroundGraceIfWorking()
+            @unknown default:
+                break
             }
         }
         .onChange(of: draftText) { _, newValue in

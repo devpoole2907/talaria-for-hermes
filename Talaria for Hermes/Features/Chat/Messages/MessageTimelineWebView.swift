@@ -24,6 +24,7 @@ struct MessageTimelineWebView: View {
     // `renderedIDs`, double-appending the just-sent turn. Coalesce instead.
     @State private var isSyncing = false
     @State private var needsResync = false
+    @State private var showScrollToBottom = false
 
     var body: some View {
         Group {
@@ -34,23 +35,76 @@ struct MessageTimelineWebView: View {
                 WebTimelineEmptyState()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                WebView(page)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    #if canImport(UIKit)
-                    // The SwiftUI WebView owns its own scroll view, which
-                    // `.scrollDismissesKeyboard` can't reach — so the swipe-to-dismiss
-                    // gesture stopped working when the timeline became a WebView. Reach
-                    // the underlying WKWebView's scroll view and restore it natively.
-                    .background(WebKeyboardDismissConfigurator())
-                    #endif
-                    .task { await sync() }
-                    .onChange(of: store.turns.count) { Task { await sync() } }
-                    .onChange(of: store.streamingRevision) { Task { await sync() } }
-                    .onChange(of: store.working) { Task { await sync() } }
-                    .onChange(of: store.reconnecting) { Task { await sync() } }
+                ZStack(alignment: .bottomTrailing) {
+                    WebView(page)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        #if canImport(UIKit)
+                        // The SwiftUI WebView owns its own scroll view, which
+                        // `.scrollDismissesKeyboard` can't reach — so the swipe-to-dismiss
+                        // gesture stopped working when the timeline became a WebView. Reach
+                        // the underlying WKWebView's scroll view and restore it natively.
+                        .background(WebKeyboardDismissConfigurator())
+                        #endif
+                        .task { await sync() }
+                        .onChange(of: store.turns.count) { Task { await sync() } }
+                        .onChange(of: store.streamingRevision) { Task { await sync() } }
+                        .onChange(of: store.working) { Task { await sync() } }
+                        .onChange(of: store.reconnecting) { Task { await sync() } }
+                        .onChange(of: store.recoveryHeartbeat) { Task { await sync() } }
+
+                    if showScrollToBottom {
+                        Button(action: scrollToBottom) {
+                            Image(systemName: "chevron.down")
+                        }
+                        .buttonStyle(.glass)
+                        .buttonBorderShape(.circle)
+                        .controlSize(.large)
+                        .accessibilityLabel("Scroll to bottom")
+                        .padding(.trailing, 16)
+                        .padding(.bottom, 16)
+                        .transition(.opacity.combined(with: .scale(scale: 0.8)))
+                    }
+                }
+                .task {
+                    await updateScrollIndicatorLoop()
+                }
             }
         }
         .background(.background)
+    }
+
+    // MARK: - UI Interactions
+
+    @MainActor
+    private func updateScrollIndicatorLoop() async {
+        while !Task.isCancelled {
+            do {
+                try await Task.sleep(for: .milliseconds(250))
+            } catch {
+                return
+            }
+            await updateScrollIndicator()
+        }
+    }
+
+    @MainActor
+    private func updateScrollIndicator() async {
+        guard didLoad else { return }
+        do {
+            let result = try await page.callJavaScript("return nearBottom();")
+            if let isNearBottom = result as? Bool {
+                showScrollToBottom = !isNearBottom
+            }
+        } catch {
+            // Silently ignore JS errors during scroll indicator checks
+        }
+    }
+
+    private func scrollToBottom() {
+        Task {
+            await runJS("jumpToBottom();")
+            showScrollToBottom = false
+        }
     }
 
     // MARK: - Sync (Swift → page)
@@ -140,7 +194,7 @@ struct MessageTimelineWebView: View {
         }
         parts.append(turn.assistantModelID ?? "")
         parts.append(reasoningText(turn) ?? "")
-        if isLast { parts.append("w:\(store.working):\(store.reconnecting)") }
+        if isLast { parts.append("w:\(store.working):\(store.reconnecting):\(store.recoveryHeartbeat ?? "")") }
         return parts.joined(separator: "|")
     }
 
@@ -316,7 +370,18 @@ struct MessageTimelineWebView: View {
     private func indicatorHTML(_ turn: ChatTurn, isLast: Bool) -> String {
         guard isLast else { return "" }
         if store.reconnecting {
-            return "<div class=\"indicator\"><span class=\"spinner\"></span><span>Reconnecting…</span></div>"
+            // When a live heartbeat is available (server exposed last_event + updated_at
+            // via the status poll), show it in place of the generic "Reconnecting…" text
+            // so the user sees proof that the run is still making progress. Fall back to
+            // the static label when no heartbeat has been set yet (first poll hasn't
+            // returned, or the server omitted those fields).
+            let label: String
+            if let heartbeat = store.recoveryHeartbeat, !heartbeat.isEmpty {
+                label = MarkdownHTMLRenderer.escape(heartbeat)
+            } else {
+                label = "Reconnecting…"
+            }
+            return "<div class=\"indicator\"><span class=\"spinner\"></span><span>\(label)</span></div>"
         }
         if store.working, !turn.hasLiveContent {
             return "<div class=\"indicator\"><span class=\"shimmer\"></span><span>Thinking…</span></div>"
@@ -539,21 +604,10 @@ struct MessageTimelineWebView: View {
         .approval-note { font-size: 13px; color: CanvasText; margin-bottom: 6px; }
         .approval-reason { font-size: 12px; color: var(--secondary); margin-top: 6px; }
 
-        /* Jump to latest */
-        #jump {
-          position: fixed; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom));
-          width: 36px; height: 36px; border-radius: 18px;
-          background: var(--fill-strong); -webkit-backdrop-filter: blur(20px); backdrop-filter: blur(20px);
-          border: 1px solid var(--hairline);
-          display: none; align-items: center; justify-content: center;
-          color: CanvasText; font-size: 17px; cursor: pointer;
-          -webkit-user-select: none; user-select: none;
-        }
         </style>
         </head>
         <body>
         <div id="container">\(body)</div>
-        <div id="jump" onclick="jumpToBottom()">↓</div>
         \(markdownLibrary.map { "<script>\($0)</script>" } ?? "")
         <script>
         var md = (typeof window.markdownit === 'function')
@@ -581,7 +635,6 @@ struct MessageTimelineWebView: View {
         }
         function scrollToBottom() { window.scrollTo(0, document.documentElement.scrollHeight); }
         function jumpToBottom() { window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' }); }
-        function updateJump() { document.getElementById('jump').style.display = nearBottom() ? 'none' : 'flex'; }
         function appendTurns(htmls) {
           var pinned = nearBottom();
           var c = document.getElementById('container');
@@ -592,7 +645,6 @@ struct MessageTimelineWebView: View {
           }
           renderMarkdown(c);
           if (pinned) scrollToBottom();
-          updateJump();
         }
         function replaceLast(html) {
           var pinned = nearBottom();
@@ -600,7 +652,6 @@ struct MessageTimelineWebView: View {
           if (c.lastElementChild) c.lastElementChild.outerHTML = html;
           renderMarkdown(c);
           if (pinned) scrollToBottom();
-          updateJump();
         }
         function toggleCollapsible(head) {
           var c = head.parentElement;
@@ -628,14 +679,12 @@ struct MessageTimelineWebView: View {
           try { document.execCommand('copy'); done(); } catch (e) {}
           document.body.removeChild(ta);
         }
-        window.addEventListener('scroll', updateJump, { passive: true });
         window.addEventListener('load', function () {
           renderMarkdown(document);
           scrollToBottom();
           requestAnimationFrame(function () {
             scrollToBottom();
             document.body.style.opacity = 1;
-            updateJump();
           });
         });
         </script>
@@ -649,9 +698,9 @@ struct MessageTimelineWebView: View {
 /// Restores swipe-to-dismiss-keyboard for the timeline WebView. The iOS 26 SwiftUI
 /// `WebView` doesn't surface its scroll view to `.scrollDismissesKeyboard`, so we
 /// reach the nearest `WKWebView`'s `scrollView` from a zero-size probe placed in
-/// the WebView's background and set `keyboardDismissMode = .interactive` (drag the
-/// keyboard down as you scroll the history, like Messages). Idempotent and re-applied
-/// on every view update, so it catches the scroll view once WebKit has built it.
+/// the WebView's background and set `keyboardDismissMode = .interactive`.
+/// Idempotent and re-applied on every view update, so it catches the scroll view
+/// once WebKit has built it.
 private struct WebKeyboardDismissConfigurator: UIViewRepresentable {
     func makeUIView(context: Context) -> UIView {
         let probe = UIView(frame: .zero)

@@ -1,5 +1,8 @@
 import Foundation
 import Observation
+#if canImport(UIKit)
+import UIKit
+#endif
 
 // MARK: - Live tool
 
@@ -83,6 +86,11 @@ final class ChatStore {
     /// True while recovering a turn whose live stream dropped (app suspended,
     /// request timeout, network blip) by polling the server for the result.
     var reconnecting: Bool = false
+    /// Live progress heartbeat shown while recovering a run whose /events stream the
+    /// server tore down (can't re-attach — see resumeRunEventsAfterDrop). We can't show
+    /// token content (the server exposes none mid-run), but run *status* still advances,
+    /// so we surface the last server event + how long ago it updated as proof of life.
+    var recoveryHeartbeat: String?
     var loading: Bool = false
     var lastError: HermesError?
     var currentRunID: String?
@@ -127,9 +135,28 @@ final class ChatStore {
     /// Reentrancy guard so only one recovery poll runs at a time.
     private var recovering = false
 
+    #if canImport(UIKit)
+    /// UIApplication background-task assertion taken when the app moves to the
+    /// background mid-run. Gives iOS ~30 s of extra CPU time so a brief app-switch
+    /// keeps the SSE socket alive and the server-side stream intact, avoiding the
+    /// unrecoverable 404 entirely for short absences. Initialized to .invalid
+    /// (sentinel meaning "no assertion held"); reset to .invalid after the assertion ends.
+    private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+    #endif
+
     /// How long to actively poll for a dropped run's result. Generous because
     /// agent runs with tool loops can take minutes; re-entering the chat retries.
     private static let recoveryWindow: TimeInterval = 360
+
+    /// Counts how many times in a row we've re-attached to /events for the same
+    /// run after a drop. Resets to 0 on the first successful live event and on each
+    /// new send, so the cap only fires when the stream keeps dropping immediately
+    /// (e.g. a server that always 503s the events endpoint on that run).
+    private var runEventReconnectAttempts = 0
+    /// Maximum consecutive reconnects before we give up and fall back to polling.
+    /// Six is generous enough for a flaky network; a legitimate stream will clear
+    /// the counter on the first real event so it never accumulates across turns.
+    private static let maxRunEventReconnects = 6
 
     private let client: HermesClient
     private let onRunCompleted: @MainActor @Sendable (String) -> Void
@@ -262,6 +289,7 @@ final class ChatStore {
         ))
         working = true
         reconnecting = false
+        recoveryHeartbeat = nil
         lastError = nil
         currentRunID = nil
         currentPartialLocalID = nil
@@ -276,6 +304,7 @@ final class ChatStore {
         needsCompletionRefresh = false
         awaitingResult = true
         recovering = false
+        runEventReconnectAttempts = 0
         rebuildTurns()
 
         // Upload documents before opening the stream. On failure, surface the
@@ -610,8 +639,12 @@ final class ChatStore {
             return
         }
 
-        // Stream ended without runCompleted (dropped connection) — recover via messages.
-        await recoverInterruptedRunsRun(runID: runID)
+        // Stream ended without runCompleted (dropped connection). Attempt to
+        // re-attach to /events rather than falling immediately to poll-based
+        // recovery — the run is almost certainly still live and no backfill means
+        // polling /messages returns nothing until it finishes. resumeRunEventsAfterDrop
+        // inspects run status and decides whether a live reconnect makes sense.
+        await resumeRunEventsAfterDrop(runID: runID)
     }
 
     /// Waits until the pending approval is cleared (user answered), then reconnects
@@ -637,9 +670,21 @@ final class ChatStore {
     private func processRunsEvent(_ event: HermesStreamEvent, runID: String) async {
         switch event {
         case .assistantDelta(let msgID, let text):
+            // First live token after a reconnect — drop the "Reconnecting…" spinner
+            // and reset the attempt counter so a later drop starts fresh. The counter
+            // reset here is the primary one; the one in send() covers the new-turn case.
+            if reconnecting {
+                reconnecting = false
+                runEventReconnectAttempts = 0
+            }
             await revealAssistantText(messageID: msgID, text: text)
 
         case .thinkingDelta(let msgID, let text):
+            // Same spinner-clear logic for thinking deltas (extended thinking models).
+            if reconnecting {
+                reconnecting = false
+                runEventReconnectAttempts = 0
+            }
             await revealThinkingText(messageID: msgID, text: text)
 
         case .runCompleted(_, let usage):
@@ -660,6 +705,7 @@ final class ChatStore {
             commitErrorResponse(error)
             working = false
             reconnecting = false
+            recoveryHeartbeat = nil
             awaitingResult = false
             streamingText.removeAll()
             streamingThinking.removeAll()
@@ -670,6 +716,12 @@ final class ChatStore {
             rebuildTurns()
 
         default:
+            // Tool events (toolStarted, toolCompleted, etc.) also count as live
+            // progress — clear the spinner so the tool card replaces it immediately.
+            if reconnecting {
+                reconnecting = false
+                runEventReconnectAttempts = 0
+            }
             // Delegate tool events, runStarted, etc. to the shared apply() path.
             apply(event)
             if event.isDiscreteStreamingEvent {
@@ -713,6 +765,7 @@ final class ChatStore {
         defer {
             recovering = false
             reconnecting = false
+            recoveryHeartbeat = nil
         }
 
         let deadline = Date.now.addingTimeInterval(Self.recoveryWindow)
@@ -742,6 +795,8 @@ final class ChatStore {
                         return
                     }
                 case "failed":
+                    // Clear the heartbeat before we bail so it doesn't linger.
+                    recoveryHeartbeat = nil
                     working = false
                     awaitingResult = false
                     reconnecting = false
@@ -749,7 +804,27 @@ final class ChatStore {
                     rebuildTurns()
                     return
                 default:
-                    // still running — also check messages in case
+                    // Run is still live ("running", "started", or an unknown future value).
+                    // Build a one-line heartbeat from the last_event + updated_at fields so
+                    // the UI shows something more informative than a dead spinner. The event
+                    // names come straight from the server; map the common ones to plain
+                    // English and fall back to the raw name (or "working") for anything new.
+                    let prettyEvent: String
+                    switch status.lastEvent {
+                    case "tool.completed":      prettyEvent = "ran a tool"
+                    case "tool.started":        prettyEvent = "running a tool"
+                    case "reasoning.available": prettyEvent = "thinking"
+                    case "message.delta":       prettyEvent = "writing"
+                    case "run.completed":       prettyEvent = "finishing"
+                    case let raw?:              prettyEvent = raw
+                    case nil:                   prettyEvent = "working"
+                    }
+                    if let updatedAt = status.updatedAt {
+                        let ago = max(0, Date().timeIntervalSince1970 - updatedAt)
+                        recoveryHeartbeat = "Working · \(prettyEvent) · updated \(Int(ago))s ago"
+                    } else {
+                        recoveryHeartbeat = "Working · \(prettyEvent)"
+                    }
                     break
                 }
             }
@@ -768,6 +843,80 @@ final class ChatStore {
         working = false
         clearActiveRunID()
         rebuildTurns()
+    }
+
+    /// Called when the /events stream for a live run drops (connection reset, app
+    /// suspension, network blip) before a `run.completed` event arrived. Rather than
+    /// falling immediately to poll-based recovery — which blocks until the whole reply
+    /// is done, giving the user a blank "Reconnecting…" spinner — we inspect run
+    /// status and re-attach to /events when the run is still live. That way the user
+    /// sees streamed tokens resume right where they left off.
+    ///
+    /// A reconnect loop guard (`runEventReconnectAttempts` / `maxRunEventReconnects`)
+    /// prevents a hard-failing stream from hammering the server. Once the cap is hit,
+    /// we fall back to poll-based recovery.
+    private func resumeRunEventsAfterDrop(runID: String) async {
+        // If status is unreachable (server down, auth failure) we can't know whether
+        // to reconnect — fall back to the poll path which handles transient outages.
+        guard let status = try? await client.runStatus(runID: runID) else {
+            await recoverInterruptedRunsRun(runID: runID)
+            return
+        }
+
+        switch status.status ?? "" {
+        case "running", "started":
+            // Run is still live — re-attach to the events tail.
+            runEventReconnectAttempts += 1
+            if runEventReconnectAttempts > Self.maxRunEventReconnects {
+                // Too many back-to-back drops on the same run. Something is wrong
+                // with this particular /events connection; fall back to polling so we
+                // don't spin in a tight reconnect loop forever.
+                await recoverInterruptedRunsRun(runID: runID)
+                return
+            }
+            // Brief backoff before reconnecting so a momentary server hiccup doesn't
+            // produce a tight reconnect burst.
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !Task.isCancelled, awaitingResult else { return }
+            // Show the spinner while we re-attach (it clears on the first live event
+            // in processRunsEvent, so it only flashes if events resume quickly).
+            reconnecting = true
+            working = true
+            rebuildTurns()
+            await streamRunEvents(runID: runID, reconnectAfterApproval: true)
+
+        case "waiting_for_approval":
+            // Run is paused at an approval gate. The /events stream naturally ended at
+            // the pause; restore the card from persistence (the approval.request event
+            // was already processed if we were live, but on a reconnect after a drop
+            // the payload is gone — the server does not replay it). Mirror the same
+            // handling as reconnectToPersistedRun's waiting_for_approval case.
+            if pendingApproval == nil,
+               let restored = loadPersistedApproval(runID: runID) {
+                pendingApproval = restored
+            }
+            currentRunID = runID
+            working = true
+            rebuildTurns()
+            await waitForApprovalAndReconnect(runID: runID)
+
+        case "completed":
+            // Run already finished — just pull the authoritative transcript.
+            await finalizeRunFromMessages()
+
+        case "failed":
+            // Run failed server-side. Clean up all live state and stop the spinner.
+            working = false
+            awaitingResult = false
+            reconnecting = false
+            clearActiveRunID()
+            rebuildTurns()
+
+        default:
+            // Unknown status (e.g. a new value from a server upgrade). Fall back to
+            // the poll path rather than guessing.
+            await recoverInterruptedRunsRun(runID: runID)
+        }
     }
 
     // MARK: - Run ID persistence
@@ -809,10 +958,43 @@ final class ChatStore {
 
     // MARK: - Runs API recovery on chat open
 
-    /// Called on chat open (after `load()`): if there's a persisted run_id that's
-    /// still running or waiting for approval, reconnect to its events stream.
+    /// Called on chat open (after `load()`) and on foreground return: if there's a
+    /// persisted run_id that's still running or waiting for approval, reconnect to
+    /// its events stream.
+    ///
+    /// Two distinct cases:
+    /// 1. Cold open / not working — normal recovery via `reconnectToPersistedRun`.
+    /// 2. Returning to foreground with an in-flight run (`awaitingResult == true`) —
+    ///    iOS tore down the SSE socket when the app was backgrounded. The stale
+    ///    `streamTask` is still technically alive (waiting on a dead socket) but will
+    ///    eventually throw; rather than waiting for that timeout, proactively cancel
+    ///    it and kick `resumeRunEventsAfterDrop` so the user sees live tokens within
+    ///    ~1 s of returning, not after a multi-second socket-read timeout.
     func recoverRunsAPIRunIfNeeded() {
-        guard useRunsAPI, !working, !awaitingResult else { return }
+        guard useRunsAPI else { return }
+
+        // Case 2: in-flight run whose live stream was probably killed by the OS when
+        // the app moved to background. Only act when we aren't already inside an
+        // active recovery (recovering flag) so we don't double-finalize. The current
+        // streamTask is cancelled so we don't end up with two competing readers on
+        // the same run.
+        if awaitingResult, let runID = currentRunID, !recovering {
+            // Cancel the stale stream socket (will cause its read to throw .cancelled,
+            // which streamRunEvents handles gracefully). Then start a fresh attach.
+            streamTask?.cancel()
+            streamTask = nil
+            let capturedRunID = runID
+            recoveryTask?.cancel()
+            recoveryTask = Task { [weak self] in
+                guard let self else { return }
+                await self.resumeRunEventsAfterDrop(runID: capturedRunID)
+                self.recoveryTask = nil
+            }
+            return
+        }
+
+        // Case 1: cold open — not working, but a persisted run_id exists.
+        guard !working, !awaitingResult else { return }
         guard let persistedRunID = repository?.activeRunID(sessionID: sessionID, profileID: profileID),
               !persistedRunID.isEmpty
         else { return }
@@ -914,6 +1096,7 @@ final class ChatStore {
         pendingApproval = nil
         working = false
         reconnecting = false
+        recoveryHeartbeat = nil
         recovering = false
         awaitingResult = false
         clearActiveRunID()
@@ -1340,35 +1523,171 @@ final class ChatStore {
         onRunCompleted(sessionID)
     }
 
-    /// Freezes the partial reply when the user taps stop: commits the text/reasoning
-    /// streamed so far as the turn's assistant message (marked finished, so it
-    /// renders as a normal bubble) instead of letting it vanish with the live state.
-    /// No-ops if there's already a committed assistant reply or nothing streamed yet.
+    /// Freezes the partial reply when the user taps stop: materializes the ordered
+    /// `liveBlocks` into `timeline` so `finalizedBlocks(in:)` reproduces exactly what
+    /// was on screen — tool cards (with args + any streamed progress) stay visible,
+    /// interleaved with assistant text in the original event order.
+    ///
+    /// If `liveBlocks` is empty (a pure text-only turn that hadn't produced a tool call
+    /// yet) we fall back to the old single-message commit so nothing regresses. We
+    /// no-op when there's already a committed assistant reply (double-commit guard) or
+    /// when nothing at all has streamed yet.
     private func commitPartialResponseOnStop() {
+        // Double-commit guard: if the run already finalized an assistant reply (e.g.
+        // the completed event raced with the stop tap) there's nothing to freeze.
         guard !hasAssistantAfterLastUser else { return }
+
         let content = activeStreamingText
         let reasoning = activeStreamingThinking
-        guard content?.isEmpty == false || reasoning?.isEmpty == false else { return }
 
-        upsertAssistantAfterLastUser(HermesMessage(
-            id: nil,
-            sessionId: sessionID,
-            role: "assistant",
-            content: content,
-            toolCalls: nil,
-            toolCallId: nil,
-            toolName: nil,
-            timestamp: Date.now.timeIntervalSince1970,
-            finishReason: "stop",
-            reasoning: reasoning,
-            reasoningContent: reasoning
-        ))
+        // If there are no live blocks AND no streamed text/reasoning, nothing to save.
+        guard !liveBlocks.isEmpty || content?.isEmpty == false || reasoning?.isEmpty == false else { return }
+
+        let now = Date.now.timeIntervalSince1970
+
+        if liveBlocks.isEmpty {
+            // Text-only turn (no tool calls seen): old single-message path so we don't
+            // regress the common case of stopping a streaming text reply.
+            upsertAssistantAfterLastUser(HermesMessage(
+                id: nil,
+                sessionId: sessionID,
+                role: "assistant",
+                content: content,
+                toolCalls: nil,
+                toolCallId: nil,
+                toolName: nil,
+                timestamp: now,
+                finishReason: "stop",
+                reasoning: reasoning,
+                reasoningContent: reasoning
+            ))
+        } else {
+            // Mixed or tool-only turn: materialize liveBlocks in event order so
+            // finalizedBlocks(in:) will reconstruct the same visual sequence.
+            //
+            // finalizedBlocks contract:
+            //   For each ASSISTANT message in the timeline slice, it emits:
+            //     (a) a .text block when content is non-empty
+            //     (b) a .tool block for each toolCalls entry, looking up output from a
+            //         sibling tool-role message whose toolCallId matches tc.id
+            //
+            // So for each LiveBlock we emit:
+            //   .text → one assistant message (content=text, toolCalls: nil)
+            //   .tool → one assistant message (toolCalls: [WireToolCall]) +
+            //           one tool-role message (role="tool", toolCallId=tool.id)
+            //
+            // Reasoning is attached to the first assistant message we emit so the
+            // "Thought for…" disclosure is preserved on the frozen turn.
+            var reasoningAttached = false
+
+            // Check whether there's trailing streamed text that didn't make it into a
+            // liveBlock yet. revealAssistantText always calls appendLiveText, so the
+            // accumulated text IS in liveBlocks — but if a turn streamed text only and
+            // never hit a tool event, liveBlocks might hold just a single .text block
+            // whose content equals activeStreamingText. If that block already captured
+            // it, we don't need to add a separate message. The safest check: see
+            // whether the last liveBlock is a .text block (it always is after text
+            // streaming, since appendLiveText accumulates into the trailing text block).
+            // activeStreamingText should equal that block's content if everything is in
+            // sync; we trust liveBlocks as the authoritative ordered source.
+
+            for block in liveBlocks {
+                switch block {
+                case .text(_, let blockContent):
+                    // Only emit a text message if there's non-empty content (an empty
+                    // text block from a pure tool-call turn doesn't need a message).
+                    guard !blockContent.isEmpty else { continue }
+                    let r = reasoningAttached ? nil : reasoning
+                    reasoningAttached = true
+                    timeline.append(TimelineMessage(message: HermesMessage(
+                        id: nil,
+                        sessionId: sessionID,
+                        role: "assistant",
+                        content: blockContent,
+                        toolCalls: nil,
+                        toolCallId: nil,
+                        toolName: nil,
+                        timestamp: now,
+                        finishReason: "stop",
+                        reasoning: r,
+                        reasoningContent: r
+                    )))
+
+                case .tool(let liveTool):
+                    // Emit the assistant "called this tool" message. finishReason must
+                    // be "tool_calls" so finalizedBlocks identifies it as a tool-call
+                    // message and looks for a sibling tool-result message. Attach
+                    // reasoning to the first message we emit if not yet attached.
+                    let r = reasoningAttached ? nil : reasoning
+                    reasoningAttached = true
+                    let wireCall = WireToolCall(
+                        id: liveTool.id,
+                        callId: liveTool.id,
+                        type: "function",
+                        function: .init(
+                            name: liveTool.name,
+                            arguments: liveTool.arguments ?? ""
+                        )
+                    )
+                    timeline.append(TimelineMessage(message: HermesMessage(
+                        id: nil,
+                        sessionId: sessionID,
+                        role: "assistant",
+                        content: nil,
+                        toolCalls: [wireCall],
+                        toolCallId: nil,
+                        toolName: nil,
+                        timestamp: now,
+                        finishReason: "tool_calls",
+                        reasoning: r,
+                        reasoningContent: r
+                    )))
+                    // Emit the tool-result message. finalizedBlocks looks up output
+                    // via `toolCallId == tc.id`, so this is what feeds the tool card's
+                    // output/progress field. Use whatever progress streamed (may be nil
+                    // if the tool was still running when stop was tapped).
+                    timeline.append(TimelineMessage(message: HermesMessage(
+                        id: nil,
+                        sessionId: sessionID,
+                        role: "tool",
+                        content: liveTool.progress,
+                        toolCalls: nil,
+                        toolCallId: liveTool.id,
+                        toolName: liveTool.name,
+                        timestamp: now,
+                        finishReason: nil,
+                        reasoning: nil,
+                        reasoningContent: nil
+                    )))
+                }
+            }
+
+            // Edge case: if reasoning exists but every liveBlock was an empty text
+            // block (skipped above) and we never attached reasoning, emit a minimal
+            // assistant message so the "Thought for…" disclosure isn't lost.
+            if !reasoningAttached, let reasoning, !reasoning.isEmpty {
+                timeline.append(TimelineMessage(message: HermesMessage(
+                    id: nil,
+                    sessionId: sessionID,
+                    role: "assistant",
+                    content: nil,
+                    toolCalls: nil,
+                    toolCallId: nil,
+                    toolName: nil,
+                    timestamp: now,
+                    finishReason: "stop",
+                    reasoning: reasoning,
+                    reasoningContent: reasoning
+                )))
+            }
+        }
+
         streamingText.removeAll()
         streamingThinking.removeAll()
         liveBlocks.removeAll()
         liveTools.removeAll()
         currentStreamMsgID = nil
-        // Persist the stopped partial so it survives the next cold launch.
+        // Persist the stopped partial (including tool calls) so it survives the next cold launch.
         repository?.upsertMessages(timeline, sessionID: sessionID, profileID: profileID)
     }
 
@@ -1579,6 +1898,46 @@ final class ChatStore {
         try? await Task.sleep(for: .milliseconds(14))
     }
 
+    // MARK: - Background task keep-alive
+
+    /// Requests a UIApplication background-task assertion so iOS grants the app ~30 s
+    /// of extra CPU time after it's backgrounded. That window keeps the SSE socket alive
+    /// long enough for brief app-switches (Control Centre, notification shade, etc.) to
+    /// return without destroying the server-side stream — sidestepping the unrecoverable
+    /// 404 that the server returns once the stream tears down.
+    ///
+    /// No-ops unless a run is actively in flight (`working || awaitingResult`) and no
+    /// assertion is already held. Does NOT require background modes in Info.plist.
+    #if canImport(UIKit)
+    func beginBackgroundGraceIfWorking() {
+        // Only take an assertion when a run is live; idle chats don't need it.
+        guard working || awaitingResult else { return }
+        // Don't stack a second assertion on top of an existing one.
+        guard backgroundTaskID == .invalid else { return }
+
+        backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "TalariaRunKeepAlive") { [weak self] in
+            // Expiration handler: called by iOS when our background time is about to
+            // run out. We must end the task here or the OS will terminate the app.
+            // The stream will drop at this point; the normal recovery path
+            // (recoverRunsAPIRunIfNeeded / recoverIfNeeded) handles it on foreground return.
+            guard let self else { return }
+            if self.backgroundTaskID != .invalid {
+                UIApplication.shared.endBackgroundTask(self.backgroundTaskID)
+                self.backgroundTaskID = .invalid
+            }
+        }
+    }
+
+    /// Ends any active background-task assertion. Call when the app returns to the
+    /// foreground so the OS can reclaim the reservation; recovery has already been
+    /// triggered by the scenePhase `.active` handler, so the stream is re-attaching.
+    func endBackgroundGrace() {
+        guard backgroundTaskID != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundTaskID)
+        backgroundTaskID = .invalid
+    }
+    #endif
+
     // MARK: - Recovery (dropped stream)
 
     /// Resumes recovery when the chat reappears or the app returns to the
@@ -1716,6 +2075,7 @@ final class ChatStore {
         awaitingResult = false
         working = false
         reconnecting = false
+        recoveryHeartbeat = nil
         lastError = nil
         streamingText.removeAll()
         streamingThinking.removeAll()

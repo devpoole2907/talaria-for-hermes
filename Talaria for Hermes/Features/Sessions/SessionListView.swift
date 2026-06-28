@@ -5,12 +5,14 @@ struct SessionListView: View {
     var onCreatedSession: (Session) -> Void = { _ in }
 
     @Environment(AppModel.self) private var appModel
+    @Environment(\.scenePhase) private var scenePhase
     @State private var showSettings: Bool = false
     @State private var creatingError: String?
     @State private var sessionToDelete: Session?
     @State private var sessionToRename: Session?
     @State private var renameText: String = ""
     @State private var searchText: String = ""
+    @State private var refreshTimer: Timer?
 
     var body: some View {
         Group {
@@ -52,6 +54,18 @@ struct SessionListView: View {
             Button("Cancel", role: .cancel) { sessionToRename = nil }
         } message: { _ in
             EmptyView()
+        }
+        .onAppear {
+            Task { await refresh() }
+            startRefreshTimer()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                Task { await refresh() }
+            }
+        }
+        .onDisappear {
+            stopRefreshTimer()
         }
     }
 
@@ -138,13 +152,12 @@ struct SessionListView: View {
                     requestDelete(session)
                 }
             } preview: {
-                // Lazily evaluated when the menu is shown, so the cache read only
-                // happens for the previewed session — never eagerly for every row.
                 SessionContextPreview(
                     session: session,
-                    messages: previewMessages(for: session),
                     isPinned: isPinned(session)
-                )
+                ) {
+                    previewMessages(for: session)
+                }
             }
             .swipeActions(edge: .trailing) {
                 Button("Delete", systemImage: "trash", role: .destructive) {
@@ -167,6 +180,7 @@ struct SessionListView: View {
 
     /// Locally cached messages for a session's chat-style context-menu preview.
     /// Read-only and side-effect-free — never hits the network or kicks off recovery.
+    @MainActor
     private func previewMessages(for session: Session) -> [TimelineMessage] {
         appModel.repository?.messages(
             sessionID: session.id,
@@ -278,5 +292,17 @@ struct SessionListView: View {
             }
         }
         sessionToRename = nil
+    }
+
+    private func startRefreshTimer() {
+        stopRefreshTimer()
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in
+            Task { await refresh() }
+        }
+    }
+
+    private func stopRefreshTimer() {
+        refreshTimer?.invalidate()
+        refreshTimer = nil
     }
 }
