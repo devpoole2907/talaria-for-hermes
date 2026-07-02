@@ -1,6 +1,7 @@
 import PhotosUI
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 struct ChatView: View {
     let session: Session
@@ -21,6 +22,7 @@ struct ChatView: View {
     @State private var showPhotoPicker: Bool = false
     @State private var showFilePicker: Bool = false
     @State private var photoSelections: [PhotosPickerItem] = []
+    @State private var isDragOver = false
 
     var body: some View {
         Group {
@@ -46,6 +48,30 @@ struct ChatView: View {
                                 onStop: { store.stop() },
                                 onAttachPhoto: { showPhotoPicker = true },
                                 onAttachFile: { showFilePicker = true }
+                            )
+                            .overlay {
+                                if isDragOver {
+                                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                                        .strokeBorder(Color.accentColor, lineWidth: 2)
+                                        .padding(.horizontal, Spacing.m)
+                                        .padding(.vertical, Spacing.xs)
+                                        .allowsHitTesting(false)
+                                }
+                            }
+                            // SwiftUI `.onDrop` and an overlay UIDropInteraction both lose
+                            // to the message TextField's own built-in drop handling on
+                            // Catalyst (a dropped CSV pastes its text into the field). The
+                            // reliable fix is to hook that text field's *own* drop pipeline
+                            // via textDropDelegate and tell UIKit the delegate performs the
+                            // drop — so files/images become attachments and no text inserts.
+                            .background(
+                                ComposerTextDropInstaller(
+                                    onDropFile: { data, name in
+                                        attachments.append(ComposerAttachment(name: name, kind: .file, data: data))
+                                    },
+                                    onDropImage: { data, name in appendPhotoData(data, name: name) },
+                                    onTargetedChanged: { isDragOver = $0 }
+                                )
                             )
                         }
                         .animation(.easeInOut(duration: 0.25), value: store.pendingApproval != nil)
@@ -158,12 +184,8 @@ struct ChatView: View {
                     failures.append(loadErrorDetail("photo returned no data"))
                     continue
                 }
-                // Downscale before it rides inline as base64, or full-res photos
-                // blow past the server's body limit (HTTP 413). Falls back to raw if
-                // the bytes aren't a decodable image.
-                let data = ImageDownscaler.prepareForUpload(raw) ?? raw
                 let name = item.itemIdentifier ?? "Photo \(attachments.count + 1)"
-                attachments.append(ComposerAttachment(name: name, kind: .photo, data: data))
+                appendPhotoData(raw, name: name)
             } catch {
                 failures.append(error.localizedDescription)
             }
@@ -182,6 +204,15 @@ struct ChatView: View {
         #endif
     }
 
+    /// Downscales and appends image bytes as a photo attachment.
+    /// Shared by the photo picker and the drag-and-drop handler.
+    private func appendPhotoData(_ raw: Data, name: String) {
+        // Downscale before it rides inline as base64 — full-res photos blow past
+        // the server's body limit (HTTP 413). Falls back to raw if not decodable.
+        let data = ImageDownscaler.prepareForUpload(raw) ?? raw
+        attachments.append(ComposerAttachment(name: name, kind: .photo, data: data))
+    }
+
     private func attachFiles(at urls: [URL]) {
         var failed: [String] = []
         for url in urls {
@@ -198,20 +229,8 @@ struct ChatView: View {
         }
     }
 
-    /// Reads a picked file's bytes. Picker URLs are security-scoped, and iCloud /
-    /// third-party provider files need a coordinated read (and may need downloading
-    /// first), so a plain `Data(contentsOf:)` can return nil for them. Coordinate
-    /// the read so those cases work instead of silently failing.
     private func readPickedFile(at url: URL) -> Data? {
-        let needsStop = url.startAccessingSecurityScopedResource()
-        defer { if needsStop { url.stopAccessingSecurityScopedResource() } }
-
-        var coordinatorError: NSError?
-        var data: Data?
-        NSFileCoordinator().coordinate(readingItemAt: url, options: [.withoutChanges], error: &coordinatorError) { readURL in
-            data = try? Data(contentsOf: readURL)
-        }
-        return data
+        SecurityScopedFileReader.read(url)
     }
 
     private var errorBinding: Binding<Bool> {
@@ -495,6 +514,306 @@ struct ChatView: View {
             } catch {
                 errorMessage = HermesError(error).errorDescription
                 appModel.haptics.error()
+            }
+        }
+    }
+}
+
+/// Reads a security-scoped / coordinated file URL's bytes. Picker and dropped URLs are
+/// security-scoped, and iCloud / third-party provider files need a coordinated read
+/// (and may need downloading first), so a plain `Data(contentsOf:)` can return nil for
+/// them. Coordinate the read so those cases work instead of silently failing.
+enum SecurityScopedFileReader {
+    nonisolated static func read(_ url: URL) -> Data? {
+        let needsStop = url.startAccessingSecurityScopedResource()
+        defer { if needsStop { url.stopAccessingSecurityScopedResource() } }
+
+        var coordinatorError: NSError?
+        var data: Data?
+        NSFileCoordinator().coordinate(readingItemAt: url, options: [.withoutChanges], error: &coordinatorError) { readURL in
+            data = try? Data(contentsOf: readURL)
+        }
+        return data
+    }
+}
+
+/// Adds file/image drag-and-drop to the composer's message field on Mac Catalyst.
+///
+/// Catalyst routes dropped content two different ways, so we need both halves:
+///
+/// * **Text-like files** (CSV, plain text, …) reach the text field's own drop pipeline.
+///   We become its `textDropDelegate`; for a file we return a proposal whose
+///   `dropPerformer` is `.delegate`, so UIKit hands the drop to us (no text inserted)
+///   and we attach it. A bare text *selection* still falls through to normal insertion.
+/// * **Binary files** (docx, pdf, images, …) are rejected by the text field and never
+///   reach `textDropDelegate` at all. For those we add a `UIDropInteraction` to the
+///   same text field, which receives every drop type.
+///
+/// The two paths are partitioned by whether the drop conforms to `public.text`, so a
+/// given drop is only ever handled once.
+struct ComposerTextDropInstaller: UIViewRepresentable {
+    /// Called on the main thread with a non-image file's bytes and name.
+    var onDropFile: (Data, String) -> Void
+    /// Called on the main thread with image bytes and a name (file image or raw image).
+    var onDropImage: (Data, String) -> Void
+    /// Drag entered (true) / left or ended (false) — drives the drop-target highlight.
+    var onTargetedChanged: (Bool) -> Void
+
+    func makeUIView(context: Context) -> UIView {
+        let probe = UIView(frame: .zero)
+        probe.isUserInteractionEnabled = false
+        probe.isHidden = true
+        return probe
+    }
+
+    func updateUIView(_ probe: UIView, context: Context) {
+        let coordinator = context.coordinator
+        coordinator.onDropFile = onDropFile
+        coordinator.onDropImage = onDropImage
+        coordinator.onTargetedChanged = onTargetedChanged
+        // Defer so the text field is in the hierarchy when we search; re-applied on
+        // every update so it re-attaches if SwiftUI rebuilds the field.
+        DispatchQueue.main.async {
+            guard let droppable = Self.nearestTextDroppable(from: probe) else {
+                #if DEBUG
+                print("[ComposerDrop] no UITextDroppable found yet")
+                #endif
+                return
+            }
+            if droppable.textDropDelegate !== coordinator {
+                droppable.textDropDelegate = coordinator
+                #if DEBUG
+                print("[ComposerDrop] attached textDropDelegate to \(type(of: droppable))")
+                #endif
+            }
+            // Add a UIDropInteraction for the binary-file drops that bypass the text
+            // pipeline. Only once per field (coordinator tracks where it installed).
+            if !coordinator.hasDropInteraction(on: droppable) {
+                droppable.addInteraction(UIDropInteraction(delegate: coordinator))
+                coordinator.didInstallDropInteraction(on: droppable)
+                #if DEBUG
+                print("[ComposerDrop] added UIDropInteraction to \(type(of: droppable))")
+                #endif
+            }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    /// Walks outward from the probe; the first ancestor subtree containing a text input
+    /// is the composer's message field (the probe sits in that composer's background).
+    private static func nearestTextDroppable(from probe: UIView) -> (UIView & UITextDroppable)? {
+        var ancestor: UIView? = probe.superview
+        while let current = ancestor {
+            if let found = descendantTextDroppable(in: current) { return found }
+            ancestor = current.superview
+        }
+        return nil
+    }
+
+    private static func descendantTextDroppable(in view: UIView) -> (UIView & UITextDroppable)? {
+        if let droppable = view as? (UIView & UITextDroppable) { return droppable }
+        for sub in view.subviews {
+            if let found = descendantTextDroppable(in: sub) { return found }
+        }
+        return nil
+    }
+
+    final class Coordinator: NSObject, UITextDropDelegate, UIDropInteractionDelegate {
+        var onDropFile: (Data, String) -> Void = { _, _ in }
+        var onDropImage: (Data, String) -> Void = { _, _ in }
+        var onTargetedChanged: (Bool) -> Void = { _ in }
+
+        private weak var dropInteractionView: UIView?
+        func hasDropInteraction(on view: UIView) -> Bool { dropInteractionView === view }
+        func didInstallDropInteraction(on view: UIView) { dropInteractionView = view }
+
+        // MARK: Drop classification
+
+        /// True when the drop carries a file we should attach rather than insert as
+        /// text. A bare plain-text *selection* registers only the plain-text UTIs; a
+        /// dropped file — even a text-based one like CSV — registers its own concrete
+        /// UTI (and/or a file URL / suggested name), which is what we key on.
+        private static func isAttachable(_ session: UIDropSession) -> Bool {
+            for item in session.items {
+                let provider = item.itemProvider
+                if provider.suggestedName != nil { return true }
+                if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) { return true }
+                if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) { return true }
+                if provider.registeredTypeIdentifiers.contains(where: { !Self.plainTextTypes.contains($0) }) {
+                    return true
+                }
+            }
+            return session.canLoadObjects(ofClass: URL.self)
+        }
+
+        /// The drop conforms to `public.text`, so it travels the text field's own drop
+        /// pipeline (handled by the `textDropDelegate` half). Used to keep the
+        /// `UIDropInteraction` half from double-handling those.
+        private static func isTextLike(_ session: UIDropSession) -> Bool {
+            session.hasItemsConforming(toTypeIdentifiers: [UTType.text.identifier])
+        }
+
+        /// The plain-text UTIs a bare selection registers — these we let the field
+        /// insert normally instead of attaching.
+        private static let plainTextTypes: Set<String> = [
+            "public.text",
+            "public.plain-text",
+            "public.utf8-plain-text",
+            "public.utf16-plain-text",
+            "public.utf16-external-plain-text",
+        ]
+
+        // MARK: UITextDropDelegate (text-like drops)
+
+        func textDroppableView(_ textDroppableView: UIView & UITextDroppable, proposalForDrop drop: UITextDropRequest) -> UITextDropProposal {
+            #if DEBUG
+            for item in drop.dropSession.items {
+                print("[ComposerDrop] text-proposal name=\(item.itemProvider.suggestedName ?? "nil") types=\(item.itemProvider.registeredTypeIdentifiers)")
+            }
+            #endif
+            guard Self.isAttachable(drop.dropSession) else {
+                #if DEBUG
+                print("[ComposerDrop] text-proposal -> .copy (let the field insert text)")
+                #endif
+                return UITextDropProposal(operation: .copy)
+            }
+            #if DEBUG
+            print("[ComposerDrop] text-proposal -> .delegate (we attach it)")
+            #endif
+            let proposal = UITextDropProposal(operation: .copy)
+            proposal.dropPerformer = .delegate // we perform it in willPerformDrop
+            return proposal
+        }
+
+        func textDroppableView(_ textDroppableView: UIView & UITextDroppable, willPerformDrop drop: UITextDropRequest) {
+            #if DEBUG
+            print("[ComposerDrop] text-willPerformDrop items=\(drop.dropSession.items.count)")
+            #endif
+            onTargetedChanged(false)
+            for item in drop.dropSession.items { load(item.itemProvider) }
+        }
+
+        func textDroppableView(_ textDroppableView: UIView & UITextDroppable, dropSessionDidEnter session: UIDropSession) {
+            if Self.isAttachable(session) { onTargetedChanged(true) }
+        }
+
+        func textDroppableView(_ textDroppableView: UIView & UITextDroppable, dropSessionDidExit session: UIDropSession) {
+            onTargetedChanged(false)
+        }
+
+        func textDroppableView(_ textDroppableView: UIView & UITextDroppable, dropSessionDidEnd session: UIDropSession) {
+            onTargetedChanged(false)
+        }
+
+        // MARK: UIDropInteractionDelegate (binary-file drops)
+
+        func dropInteraction(_ interaction: UIDropInteraction, canHandle session: UIDropSession) -> Bool {
+            // Text-like drops are handled by the textDropDelegate half; take everything
+            // else that's a file/image here so binary types (docx, pdf, …) aren't lost.
+            let handled = Self.isAttachable(session) && !Self.isTextLike(session)
+            #if DEBUG
+            if handled {
+                for item in session.items {
+                    print("[ComposerDrop] interaction-canHandle types=\(item.itemProvider.registeredTypeIdentifiers)")
+                }
+            }
+            #endif
+            return handled
+        }
+
+        func dropInteraction(_ interaction: UIDropInteraction, sessionDidUpdate session: UIDropSession) -> UIDropProposal {
+            UIDropProposal(operation: .copy)
+        }
+
+        func dropInteraction(_ interaction: UIDropInteraction, sessionDidEnter session: UIDropSession) {
+            onTargetedChanged(true)
+        }
+
+        func dropInteraction(_ interaction: UIDropInteraction, sessionDidExit session: UIDropSession) {
+            onTargetedChanged(false)
+        }
+
+        func dropInteraction(_ interaction: UIDropInteraction, sessionDidEnd session: UIDropSession) {
+            onTargetedChanged(false)
+        }
+
+        func dropInteraction(_ interaction: UIDropInteraction, performDrop session: UIDropSession) {
+            #if DEBUG
+            print("[ComposerDrop] interaction-performDrop items=\(session.items.count)")
+            #endif
+            onTargetedChanged(false)
+            for item in session.items { load(item.itemProvider) }
+        }
+
+        // MARK: Loading
+
+        /// Loads a dropped item's bytes via its data representation (works for any file
+        /// type, including ones that don't vend a `public.file-url`), classifies it as
+        /// image or file, and forwards it on the main thread.
+        private func load(_ provider: NSItemProvider) {
+            let name = provider.suggestedName ?? "Dropped File"
+            // Raw image with no backing file (e.g. dragged from a browser).
+            if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier),
+               !provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { [weak self] data, error in
+                    #if DEBUG
+                    print("[ComposerDrop] image load bytes=\(data?.count ?? -1) error=\(String(describing: error))")
+                    #endif
+                    guard let self, let data else { return }
+                    DispatchQueue.main.async { self.onDropImage(data, name) }
+                }
+                return
+            }
+            guard let typeID = Self.fileTypeIdentifier(for: provider) else {
+                #if DEBUG
+                print("[ComposerDrop] no loadable content type in \(provider.registeredTypeIdentifiers); trying file URL")
+                #endif
+                loadViaFileURL(provider, fallbackName: name)
+                return
+            }
+            provider.loadDataRepresentation(forTypeIdentifier: typeID) { [weak self] data, error in
+                #if DEBUG
+                print("[ComposerDrop] file load type=\(typeID) bytes=\(data?.count ?? -1) error=\(String(describing: error))")
+                #endif
+                guard let self, let data else { return }
+                let isImage = UTType(typeID)?.conforms(to: .image) ?? false
+                DispatchQueue.main.async {
+                    if isImage { self.onDropImage(data, name) }
+                    else { self.onDropFile(data, name) }
+                }
+            }
+        }
+
+        /// The richest concrete content type the provider can vend as raw bytes,
+        /// skipping URL wrappers (`public.file-url`/`public.url`) whose "bytes" are the
+        /// path string rather than the file's contents.
+        private static func fileTypeIdentifier(for provider: NSItemProvider) -> String? {
+            for id in provider.registeredTypeIdentifiers {
+                guard let type = UTType(id) else { continue }
+                if type.conforms(to: .url) { continue }
+                if type.conforms(to: .data) || type.conforms(to: .content) { return id }
+            }
+            return nil
+        }
+
+        /// Fallback for providers that only vend a file URL: read the file's bytes
+        /// while the dropped URL's security-scoped access is still valid.
+        private func loadViaFileURL(_ provider: NSItemProvider, fallbackName: String) {
+            guard provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) else { return }
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { [weak self] item, _ in
+                guard let self else { return }
+                let url: URL?
+                if let nsURL = item as? NSURL { url = nsURL as URL }
+                else if let data = item as? Data { url = URL(dataRepresentation: data, relativeTo: nil) }
+                else { url = nil }
+                guard let url, let data = SecurityScopedFileReader.read(url) else { return }
+                let name = url.lastPathComponent.isEmpty ? fallbackName : url.lastPathComponent
+                let isImage = UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) ?? false
+                DispatchQueue.main.async {
+                    if isImage { self.onDropImage(data, name) }
+                    else { self.onDropFile(data, name) }
+                }
             }
         }
     }

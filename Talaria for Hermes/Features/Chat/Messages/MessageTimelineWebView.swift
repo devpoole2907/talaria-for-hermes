@@ -710,7 +710,6 @@ private struct WebKeyboardDismissConfigurator: UIViewRepresentable {
     }
 
     func updateUIView(_ probe: UIView, context: Context) {
-        // Defer so the WKWebView is in the hierarchy when we search.
         DispatchQueue.main.async {
             guard let scrollView = Self.nearestWebScrollView(from: probe) else { return }
             if scrollView.keyboardDismissMode != .interactive {
